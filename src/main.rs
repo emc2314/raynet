@@ -2,9 +2,10 @@ use clap::{Arg, Command};
 use env_logger::Env;
 use futures::future::join_all;
 use kcp::Kcp;
-use log::debug;
+use log::{debug, error, info};
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::prelude::IteratorRandom;
+use rand::Rng;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -13,10 +14,15 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
+
 #[derive(Debug)]
-enum RawPacket {
-    UDP(Vec<u8>, SocketAddr),
-    TCP(Vec<u8>, SocketAddr),
+struct UDPPacket {
+    data: Vec<u8>,
+}
+#[derive(Debug)]
+struct TCPPacket {
+    data: Vec<u8>,
+    conv: u32,
 }
 
 #[tokio::main]
@@ -62,14 +68,21 @@ async fn main() -> io::Result<()> {
         .get_one::<String>("listen")
         .unwrap()
         .to_socket_addrs()
-        .expect("Unable to resolve listen address").next().unwrap();
+        .expect("Unable to resolve listen address")
+        .next()
+        .unwrap();
     let send_addr: Vec<SocketAddr> = matches
         .get_many::<String>("send")
         .unwrap()
-        .map(|str| str.to_socket_addrs().expect("Unable to resolve send address").next().unwrap())
+        .map(|str| {
+            str.to_socket_addrs()
+                .expect("Unable to resolve send address")
+                .next()
+                .unwrap()
+        })
         .collect::<Vec<SocketAddr>>();
 
-    let (tx, mut rx) = mpsc::channel::<RawPacket>(65536);
+    let (udp_tx, mut udp_rx) = mpsc::channel::<UDPPacket>(65536);
     let udp_socket = UdpSocket::bind(listen_addr).await?;
     let udp_socket_outs: Vec<UdpSocket> = join_all(
         (0..32)
@@ -87,160 +100,183 @@ async fn main() -> io::Result<()> {
                 match udp_socket.recv_from(&mut buf).await {
                     Ok((size, src)) => {
                         debug!("Received {} bytes from {}", size, src);
-                        if let Err(e) = tx.send(RawPacket::UDP(buf[..size].to_vec(), src)).await {
-                            eprintln!("Failed to send to channel: {}", e);
+                        if let Err(e) = udp_tx
+                            .send(UDPPacket {
+                                data: buf[..size].to_vec(),
+                            })
+                            .await
+                        {
+                            error!("Failed to send to channel: {}", e);
                         }
                     }
-                    Err(e) => eprintln!("Failed to receive from UDP: {}", e),
+                    Err(e) => error!("Failed to receive from UDP: {}", e),
                 }
             }
         });
 
         // Output thread
         tokio::spawn(async move {
-            while let Some(packet) = rx.recv().await {
-                match packet {
-                    RawPacket::UDP(data, _) => {
-                        let remote = send_addr.iter().choose(&mut rand::thread_rng()).unwrap();
-                        let udp_socket_out = udp_socket_outs
-                            .iter()
-                            .choose(&mut rand::thread_rng())
-                            .unwrap();
-                        match udp_socket_out.send_to(&data, remote).await {
-                            Ok(sent_size) => debug!("Sent {} bytes to {}", sent_size, remote),
-                            Err(e) => eprintln!("Failed to send to UDP: {}", e),
-                        }
-                    }
-                    _ => {}
+            while let Some(packet) = udp_rx.recv().await {
+                let remote = send_addr.iter().choose(&mut rand::thread_rng()).unwrap();
+                let udp_socket_out = udp_socket_outs
+                    .iter()
+                    .choose(&mut rand::thread_rng())
+                    .unwrap();
+                match udp_socket_out.send_to(&packet.data, remote).await {
+                    Ok(sent_size) => debug!("Sent {} bytes to {}", sent_size, remote),
+                    Err(e) => error!("Failed to send to UDP: {}", e),
                 }
             }
         });
+        info!("Started RayNet Forwarder");
     } else {
         let connections = Arc::new(RwLock::new(HashMap::<
-            _,
+            u32,
             Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
         >::new()));
+        let (tcp_tx, mut tcp_rx) = mpsc::channel::<TCPPacket>(65536);
 
         // UDP input thread
-        let tx_udp = tx.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 65535];
-            loop {
-                match udp_socket.recv_from(&mut buf).await {
-                    Ok((size, src)) => {
-                        debug!("Received {} bytes from UDP {}", size, src);
-                        if let Err(e) = tx_udp.send(RawPacket::UDP(buf[..size].to_vec(), src)).await
-                        {
-                            eprintln!("Failed to send to channel: {}", e);
+        {
+            let connections = connections.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65535];
+                loop {
+                    match udp_socket.recv_from(&mut buf).await {
+                        Ok((size, src)) => {
+                            debug!("Received {} bytes from UDP {}", size, src);
+                            let conv = {
+                                connections
+                                    .read()
+                                    .await
+                                    .iter()
+                                    .choose(&mut rand::thread_rng())
+                                    .map(|(conv, _)| (conv.clone()))
+                            };
+                            if let Some(conv) = conv {
+                                if let Err(e) = tcp_tx
+                                    .send(TCPPacket {
+                                        data: buf[..size].to_vec(),
+                                        conv: conv,
+                                    })
+                                    .await
+                                {
+                                    error!("Failed to send to channel: {}", e);
+                                }
+                            } else {
+                                error!("No spare connection");
+                            }
                         }
+                        Err(e) => error!("Failed to receive from UDP: {}", e),
                     }
-                    Err(e) => eprintln!("Failed to receive from UDP: {}", e),
                 }
-            }
-        });
+            });
+        }
 
         // TCP listener thread
-        let tcp_listener = TcpListener::bind(listen_addr).await?;
-        let tx_tcp = tx.clone();
-        let connections_tcp = connections.clone();
-        tokio::spawn(async move {
-            loop {
-                match tcp_listener.accept().await {
-                    Ok((tcp_stream, _cid)) => {
-                        let (tcp_read, tcp_write) = tcp_stream.into_split();
-                        debug!("New TCP connection: {}", _cid);
-                        {
-                            connections_tcp
-                                .write()
-                                .await
-                                .insert(_cid, Arc::new(Mutex::new(tcp_write)));
-                        }
+        {
+            let tcp_listener = TcpListener::bind(listen_addr).await?;
+            let connections = connections.clone();
+            tokio::spawn(async move {
+                loop {
+                    match tcp_listener.accept().await {
+                        Ok((tcp_stream, _src)) => {
+                            let (tcp_read, tcp_write) = tcp_stream.into_split();
+                            let conv = rand::thread_rng().gen::<u32>();
+                            info!("New TCP connection: {} as {}", _src, conv);
+                            {
+                                connections
+                                    .write()
+                                    .await
+                                    .insert(conv, Arc::new(Mutex::new(tcp_write)));
+                            }
 
-                        let tx_tcp_clone = tx_tcp.clone();
-                        tokio::spawn(async move {
-                            let mut buf = vec![0u8; 65535];
-                            loop {
-                                match tcp_read.try_read(&mut buf) {
-                                    Ok(0) => {
-                                        debug!("TCP connection closed: {}", _cid);
-                                        break;
-                                    }
-                                    Ok(len) => {
-                                        debug!("Received {} bytes from TCP {}", len, _cid);
-                                        if let Err(e) = tx_tcp_clone
-                                            .send(RawPacket::TCP(buf[..len].to_vec(), _cid))
-                                            .await
-                                        {
-                                            eprintln!("Failed to send to channel: {}", e);
+                            let tx_clone = udp_tx.clone();
+                            tokio::spawn(async move {
+                                let mut buf = vec![0u8; 65535];
+                                loop {
+                                    match tcp_read.try_read(&mut buf) {
+                                        Ok(0) => {
+                                            info!("TCP connection closed: {}", conv);
+                                            // TODO: Inform the opposite end
+                                            break;
+                                        }
+                                        Ok(len) => {
+                                            debug!("Received {} bytes from TCP {}", len, conv);
+                                            if let Err(e) = tx_clone
+                                                .send(UDPPacket {
+                                                    data: buf[..len].to_vec(),
+                                                })
+                                                .await
+                                            {
+                                                error!("Failed to send to channel: {}", e);
+                                            }
+                                        }
+                                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                            tokio::time::sleep(tokio::time::Duration::from_millis(
+                                                1,
+                                            ))
+                                            .await;
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to read from TCP stream: {}", e);
+                                            // TODO: Inform the opposite end
+                                            break;
                                         }
                                     }
-                                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(1))
-                                            .await;
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Failed to read from TCP stream: {}", e);
-                                        break;
-                                    }
                                 }
-                            }
-                        });
+                            });
+                        }
+                        Err(e) => error!("Failed to accept TCP connection: {}", e),
                     }
-                    Err(e) => eprintln!("Failed to accept TCP connection: {}", e),
                 }
-            }
-        });
-
+            });
+        }
         // Output thread
-        let connections_out = connections.clone();
-        tokio::spawn(async move {
-            while let Some(packet) = rx.recv().await {
-                match packet {
-                    RawPacket::UDP(data, _) => {
-                        let chosen_connection = {
-                            connections_out
-                                .read()
-                                .await
-                                .iter()
-                                .choose(&mut rand::thread_rng())
-                                .map(|(cid, tcp_write)| (cid.clone(), Arc::clone(tcp_write)))
-                        };
-                        if let Some((_cid, tcp_write)) = chosen_connection {
-                            let tcp_write = tcp_write.lock().await;
-                            match tcp_write.try_write(&data) {
-                                Ok(n) => debug!("Forwarded {} bytes to TCP stream {}", n, _cid),
-                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to write to TCP stream {}: {}", _cid, e);
-                                    connections_out.write().await.remove(&_cid);
-                                }
-                            }
+        {
+            let connections = connections.clone();
+            tokio::spawn(async move {
+                while let Some(packet) = tcp_rx.recv().await {
+                    let tcp_write = { connections.read().await[&packet.conv].clone() };
+                    let tcp_write = tcp_write.lock().await;
+                    match tcp_write.try_write(&packet.data) {
+                        Ok(n) => debug!("Forwarded {} bytes to TCP stream {}", n, packet.conv),
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                         }
-                    }
-                    RawPacket::TCP(data, _) => {
-                        let mut cur = 0;
-                        while data.len() > cur {
-                            let remote = send_addr.iter().choose(&mut rand::thread_rng()).unwrap();
-                            let udp_socket_out = udp_socket_outs
-                                .iter()
-                                .choose(&mut rand::thread_rng())
-                                .unwrap();
-                            let size = udp_socket_out
-                                .send_to(&data[cur..std::cmp::min(data.len(), cur + 1200)], remote)
-                                .await
-                                .expect("Failed to send to UDP: {}");
-                            debug!("Sent {} bytes to UDP {}", size, remote);
-                            cur += size;
+                        Err(e) => {
+                            error!("Failed to write to TCP stream {}: {}", packet.conv, e);
+                            connections.write().await.remove(&packet.conv);
                         }
                     }
                 }
+            });
+        }
+        tokio::spawn(async move {
+            while let Some(packet) = udp_rx.recv().await {
+                let mut cur = 0;
+                while packet.data.len() > cur {
+                    let remote = send_addr.iter().choose(&mut rand::thread_rng()).unwrap();
+                    let udp_socket_out = udp_socket_outs
+                        .iter()
+                        .choose(&mut rand::thread_rng())
+                        .unwrap();
+                    let size = udp_socket_out
+                        .send_to(
+                            &packet.data[cur..std::cmp::min(packet.data.len(), cur + 1200)],
+                            remote,
+                        )
+                        .await
+                        .expect("Failed to send to UDP: {}");
+                    debug!("Sent {} bytes to UDP {}", size, remote);
+                    cur += size;
+                }
             }
         });
+        info!("Started RayNet Endpoint");
     }
 
     tokio::signal::ctrl_c().await?;
-    println!("Ctrl-C received, shutting down");
+    info!("Ctrl-C received, shutting down");
     Ok(())
 }
