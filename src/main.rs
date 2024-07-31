@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::{mpsc, RwLock};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 
@@ -23,6 +24,20 @@ struct UDPPacket {
 struct TCPPacket {
     data: Vec<u8>,
     conv: u32,
+}
+
+#[derive(Debug)]
+struct Connections {
+    spare: HashMap<SocketAddr, tokio::net::tcp::OwnedWriteHalf>,
+    active: HashMap<u32, Arc<tokio::net::tcp::OwnedWriteHalf>>,
+}
+
+impl Connections {
+    fn new() -> Connections {
+        let spare = HashMap::<SocketAddr, tokio::net::tcp::OwnedWriteHalf>::new();
+        let active = HashMap::<u32, Arc<tokio::net::tcp::OwnedWriteHalf>>::new();
+        Connections { spare, active }
+    }
 }
 
 #[tokio::main]
@@ -130,48 +145,35 @@ async fn main() -> io::Result<()> {
         });
         info!("Started RayNet Forwarder");
     } else {
-        let connections = Arc::new(RwLock::new(HashMap::<
-            u32,
-            Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
-        >::new()));
+        let connections = Arc::new(RwLock::new(Connections::new()));
         let (tcp_tx, mut tcp_rx) = mpsc::channel::<TCPPacket>(65536);
 
         // UDP input thread
-        {
-            let connections = connections.clone();
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 65535];
-                loop {
-                    match udp_socket.recv_from(&mut buf).await {
-                        Ok((size, src)) => {
-                            debug!("Received {} bytes from UDP {}", size, src);
-                            let conv = {
-                                connections
-                                    .read()
-                                    .await
-                                    .iter()
-                                    .choose(&mut rand::thread_rng())
-                                    .map(|(conv, _)| (conv.clone()))
-                            };
-                            if let Some(conv) = conv {
-                                if let Err(e) = tcp_tx
-                                    .send(TCPPacket {
-                                        data: buf[..size].to_vec(),
-                                        conv: conv,
-                                    })
-                                    .await
-                                {
-                                    error!("Failed to send to channel: {}", e);
-                                }
-                            } else {
-                                error!("No spare connection");
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                match udp_socket.recv_from(&mut buf).await {
+                    Ok((size, src)) => {
+                        debug!("Received {} bytes from UDP {}", size, src);
+                        let conv = Some(0);
+                        if let Some(conv) = conv {
+                            if let Err(e) = tcp_tx
+                                .send(TCPPacket {
+                                    data: buf[..size].to_vec(),
+                                    conv: conv,
+                                })
+                                .await
+                            {
+                                error!("Failed to send to channel: {}", e);
                             }
+                        } else {
+                            error!("No spare connection");
                         }
-                        Err(e) => error!("Failed to receive from UDP: {}", e),
                     }
+                    Err(e) => error!("Failed to receive from UDP: {}", e),
                 }
-            });
-        }
+            }
+        });
 
         // TCP listener thread
         {
@@ -180,29 +182,36 @@ async fn main() -> io::Result<()> {
             tokio::spawn(async move {
                 loop {
                     match tcp_listener.accept().await {
-                        Ok((tcp_stream, _src)) => {
+                        Ok((tcp_stream, src)) => {
                             let (tcp_read, tcp_write) = tcp_stream.into_split();
-                            let conv = rand::thread_rng().gen::<u32>();
-                            info!("New TCP connection: {} as {}", _src, conv);
+                            info!("New TCP connection: {}", src);
                             {
-                                connections
-                                    .write()
-                                    .await
-                                    .insert(conv, Arc::new(Mutex::new(tcp_write)));
+                                connections.write().await.spare.insert(src, tcp_write);
                             }
 
                             let tx_clone = udp_tx.clone();
+                            let connections = connections.clone();
                             tokio::spawn(async move {
                                 let mut buf = vec![0u8; 65535];
                                 loop {
                                     match tcp_read.try_read(&mut buf) {
                                         Ok(0) => {
-                                            info!("TCP connection closed: {}", conv);
+                                            info!("TCP connection closed: {}", src);
                                             // TODO: Inform the opposite end
                                             break;
                                         }
                                         Ok(len) => {
-                                            debug!("Received {} bytes from TCP {}", len, conv);
+                                            debug!("Received {} bytes from TCP {}", len, src);
+                                            let con = connections.read().await;
+                                            if con.spare.contains_key(&src) {
+                                                drop(con);
+                                                let mut con = connections.write().await;
+                                                if let Some(tcp_write) = con.spare.remove(&src) {
+                                                    let conv = 0;
+                                                    con.active.insert(conv, tcp_write.into());
+                                                    debug!("Assign TCP {} as {}", src, conv);
+                                                }
+                                            }
                                             if let Err(e) = tx_clone
                                                 .send(UDPPacket {
                                                     data: buf[..len].to_vec(),
@@ -237,17 +246,45 @@ async fn main() -> io::Result<()> {
             let connections = connections.clone();
             tokio::spawn(async move {
                 while let Some(packet) = tcp_rx.recv().await {
-                    let tcp_write = { connections.read().await[&packet.conv].clone() };
-                    let tcp_write = tcp_write.lock().await;
-                    match tcp_write.try_write(&packet.data) {
-                        Ok(n) => debug!("Forwarded {} bytes to TCP stream {}", n, packet.conv),
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                    let conv = packet.conv;
+                    let tcp_write = {
+                        let con = connections.read().await;
+                        if con.active.contains_key(&conv) {
+                            Some(con.active[&conv].clone())
+                        } else {
+                            drop(con);
+                            let mut con = connections.write().await;
+                            match con.spare.iter().next() {
+                                Some((&src, _)) => {
+                                    let tcp_write: Arc<tokio::net::tcp::OwnedWriteHalf> =
+                                        con.spare.remove(&src).unwrap().into();
+                                    con.active.insert(conv, tcp_write.clone());
+                                    debug!("Assign TCP {} as {}", src, conv);
+                                    Some(tcp_write)
+                                }
+                                None => None,
+                            }
                         }
-                        Err(e) => {
-                            error!("Failed to write to TCP stream {}: {}", packet.conv, e);
-                            connections.write().await.remove(&packet.conv);
+                    };
+                    if let Some(tcp_write) = tcp_write {
+                        loop {
+                            match tcp_write.try_write(&packet.data) {
+                                Ok(n) => {
+                                    debug!("Forwarded {} bytes to TCP stream {}", n, conv);
+                                    break;
+                                }
+                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                                }
+                                Err(e) => {
+                                    error!("Failed to write to TCP stream {}: {}", conv, e);
+                                    connections.write().await.active.remove(&conv);
+                                    break;
+                                }
+                            }
                         }
+                    } else {
+                        error!("No spare connection");
                     }
                 }
             });
