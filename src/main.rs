@@ -1,42 +1,64 @@
 use clap::{Arg, Command};
 use env_logger::Env;
 use futures::future::join_all;
-use kcp::Kcp;
 use log::{debug, error, info};
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::prelude::IteratorRandom;
 use rand::Rng;
+use rkcp::session::KcpSession;
+use rkcp::socket::KcpSocket;
 use std::collections::HashMap;
+use std::fmt::{self, Debug};
 use std::io;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, RwLock};
-use tokio::sync::{mpsc, Mutex, RwLock};
 
+mod packets;
+mod rkcp;
+mod utils;
 
-#[derive(Debug)]
-struct UDPPacket {
-    data: Vec<u8>,
+use packets::{KcpOutput, KcpRecv, TCPPacket, UDPPacket};
+
+fn _softmax(vec: &[f64], rng: &mut rand::rngs::ThreadRng) -> usize {
+    let exps: Vec<f64> = vec.iter().map(|&x| x.exp()).collect();
+    let sum: f64 = exps.iter().sum();
+
+    let dist = WeightedIndex::new(exps.iter().map(|&x| x / sum).collect::<Vec<_>>()).unwrap();
+    dist.sample(rng)
 }
-#[derive(Debug)]
-struct TCPPacket {
-    data: Vec<u8>,
-    conv: u32,
-}
 
 #[derive(Debug)]
+struct _NodeInfo {
+    nid: u8,
+    addr: SocketAddr,
+    clc: u64,
+    llc: u64,
+}
+
 struct Connections {
-    spare: HashMap<SocketAddr, tokio::net::tcp::OwnedWriteHalf>,
-    active: HashMap<u32, Arc<tokio::net::tcp::OwnedWriteHalf>>,
+    cons: HashMap<SocketAddr, tokio::net::tcp::OwnedWriteHalf>,
+    convs: HashMap<SocketAddr, u32>,
+    kcps: HashMap<u32, Arc<KcpSession>>,
 }
 
 impl Connections {
     fn new() -> Connections {
-        let spare = HashMap::<SocketAddr, tokio::net::tcp::OwnedWriteHalf>::new();
-        let active = HashMap::<u32, Arc<tokio::net::tcp::OwnedWriteHalf>>::new();
-        Connections { spare, active }
+        let cons = HashMap::new();
+        let convs = HashMap::new();
+        let kcps = HashMap::new();
+        Connections { cons, convs, kcps }
+    }
+}
+impl Debug for Connections {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Connections")
+            .field("cons", &self.cons)
+            .field("convs", &self.convs)
+            .field("kcps", &self.kcps)
+            .finish()
     }
 }
 
@@ -97,6 +119,7 @@ async fn main() -> io::Result<()> {
         })
         .collect::<Vec<SocketAddr>>();
 
+    let connections = Arc::new(RwLock::new(Connections::new()));
     let (udp_tx, mut udp_rx) = mpsc::channel::<UDPPacket>(65536);
     let udp_socket = UdpSocket::bind(listen_addr).await?;
     let udp_socket_outs: Vec<UdpSocket> = join_all(
@@ -145,35 +168,75 @@ async fn main() -> io::Result<()> {
         });
         info!("Started RayNet Forwarder");
     } else {
-        let connections = Arc::new(RwLock::new(Connections::new()));
         let (tcp_tx, mut tcp_rx) = mpsc::channel::<TCPPacket>(65536);
 
         // UDP input thread
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 65535];
-            loop {
-                match udp_socket.recv_from(&mut buf).await {
-                    Ok((size, src)) => {
-                        debug!("Received {} bytes from UDP {}", size, src);
-                        let conv = Some(0);
-                        if let Some(conv) = conv {
-                            if let Err(e) = tcp_tx
-                                .send(TCPPacket {
-                                    data: buf[..size].to_vec(),
-                                    conv: conv,
-                                })
-                                .await
-                            {
-                                error!("Failed to send to channel: {}", e);
+        {
+            let connections = connections.clone();
+            let udp_tx = udp_tx.clone();
+            let tcp_tx = tcp_tx.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65535];
+                loop {
+                    match udp_socket.recv_from(&mut buf).await {
+                        Ok((size, src)) => {
+                            debug!("Received {} bytes from UDP {}", size, src);
+                            let conv = kcp::get_conv(&buf);
+                            let session = {
+                                let con = connections.read().await;
+                                if con.kcps.contains_key(&conv) {
+                                    Some(con.kcps[&conv].clone())
+                                } else {
+                                    drop(con);
+                                    let mut con = connections.write().await;
+                                    con.cons
+                                        .keys()
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                        .iter()
+                                        .find_map(|addr| {
+                                            if !con.convs.contains_key(addr) {
+                                                let config = Default::default();
+                                                let kcp = KcpSocket::new(
+                                                    &config,
+                                                    conv,
+                                                    KcpOutput::new(udp_tx.clone()),
+                                                    false,
+                                                )
+                                                .unwrap();
+                                                let session = KcpSession::new_shared(
+                                                    kcp,
+                                                    KcpRecv::new(tcp_tx.clone(), addr.clone()),
+                                                    config.session_expire,
+                                                    false,
+                                                );
+                                                con.convs.insert(addr.clone(), conv);
+                                                con.kcps.insert(conv, session.clone());
+                                                info!("Assign TCP {} as {}", addr, conv);
+                                                Some(session)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                }
+                            };
+                            if let Some(session) = session {
+                                if let Err(_) = session.input(&buf[..size]).await {
+                                    error!("KCP session {} closed when input", conv);
+                                    let mut con = connections.write().await;
+                                    if let Some(conv) = con.convs.remove(&session.kcp_recv().addr) {
+                                        con.kcps.remove(&conv);
+                                    }
+                                }
+                            } else {
+                                error!("No spare connection");
                             }
-                        } else {
-                            error!("No spare connection");
                         }
+                        Err(e) => error!("Failed to receive from UDP: {}", e),
                     }
-                    Err(e) => error!("Failed to receive from UDP: {}", e),
                 }
-            }
-        });
+            });
+        }
 
         // TCP listener thread
         {
@@ -186,39 +249,88 @@ async fn main() -> io::Result<()> {
                             let (tcp_read, tcp_write) = tcp_stream.into_split();
                             info!("New TCP connection: {}", src);
                             {
-                                connections.write().await.spare.insert(src, tcp_write);
+                                connections.write().await.cons.insert(src, tcp_write);
                             }
 
-                            let tx_clone = udp_tx.clone();
                             let connections = connections.clone();
+                            let udp_tx = udp_tx.clone();
+                            let tcp_tx = tcp_tx.clone();
                             tokio::spawn(async move {
                                 let mut buf = vec![0u8; 65535];
                                 loop {
                                     match tcp_read.try_read(&mut buf) {
                                         Ok(0) => {
                                             info!("TCP connection closed: {}", src);
+                                            let mut con = connections.write().await;
+                                            if let Some(conv) = con.convs.remove(&src) {
+                                                con.kcps.remove(&conv);
+                                            }
                                             // TODO: Inform the opposite end
                                             break;
                                         }
                                         Ok(len) => {
                                             debug!("Received {} bytes from TCP {}", len, src);
-                                            let con = connections.read().await;
-                                            if con.spare.contains_key(&src) {
-                                                drop(con);
-                                                let mut con = connections.write().await;
-                                                if let Some(tcp_write) = con.spare.remove(&src) {
-                                                    let conv = 0;
-                                                    con.active.insert(conv, tcp_write.into());
-                                                    debug!("Assign TCP {} as {}", src, conv);
+                                            let session = {
+                                                let con = connections.read().await;
+                                                if let Some(conv) = con.convs.get(&src) {
+                                                    Some(con.kcps[conv].clone())
+                                                } else {
+                                                    drop(con);
+                                                    let mut con = connections.write().await;
+                                                    let conv = rand::thread_rng().gen::<u32>();
+                                                    con.cons
+                                                        .keys()
+                                                        .cloned()
+                                                        .collect::<Vec<_>>()
+                                                        .iter()
+                                                        .find_map(|addr| {
+                                                            if !con.convs.contains_key(addr) {
+                                                                let config = Default::default();
+                                                                let kcp = KcpSocket::new(
+                                                                    &config,
+                                                                    conv,
+                                                                    KcpOutput::new(udp_tx.clone()),
+                                                                    false,
+                                                                )
+                                                                .unwrap();
+                                                                let session =
+                                                                    KcpSession::new_shared(
+                                                                        kcp,
+                                                                        KcpRecv::new(
+                                                                            tcp_tx.clone(),
+                                                                            addr.clone(),
+                                                                        ),
+                                                                        config.session_expire,
+                                                                        true,
+                                                                    );
+                                                                con.convs
+                                                                    .insert(addr.clone(), conv);
+                                                                con.kcps
+                                                                    .insert(conv, session.clone());
+                                                                info!(
+                                                                    "Assign TCP {} as {}",
+                                                                    addr, conv
+                                                                );
+                                                                Some(session)
+                                                            } else {
+                                                                None
+                                                            }
+                                                        })
                                                 }
-                                            }
-                                            if let Err(e) = tx_clone
-                                                .send(UDPPacket {
-                                                    data: buf[..len].to_vec(),
-                                                })
-                                                .await
-                                            {
-                                                error!("Failed to send to channel: {}", e);
+                                            };
+                                            if let Some(session) = session {
+                                                if let Err(_) = session.send(&buf[..len]).await {
+                                                    error!(
+                                                        "KCP session {} closed when send",
+                                                        session.conv()
+                                                    );
+                                                    let mut con = connections.write().await;
+                                                    if let Some(conv) = con.convs.remove(&src) {
+                                                        con.kcps.remove(&conv);
+                                                    }
+                                                }
+                                            } else {
+                                                error!("No spare connection");
                                             }
                                         }
                                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -229,11 +341,16 @@ async fn main() -> io::Result<()> {
                                         }
                                         Err(e) => {
                                             error!("Failed to read from TCP stream: {}", e);
+                                            let mut con = connections.write().await;
+                                            if let Some(conv) = con.convs.remove(&src) {
+                                                con.kcps.remove(&conv);
+                                            }
                                             // TODO: Inform the opposite end
                                             break;
                                         }
                                     }
                                 }
+                                connections.write().await.cons.remove(&src);
                             });
                         }
                         Err(e) => error!("Failed to accept TCP connection: {}", e),
@@ -246,39 +363,24 @@ async fn main() -> io::Result<()> {
             let connections = connections.clone();
             tokio::spawn(async move {
                 while let Some(packet) = tcp_rx.recv().await {
-                    let conv = packet.conv;
-                    let tcp_write = {
-                        let con = connections.read().await;
-                        if con.active.contains_key(&conv) {
-                            Some(con.active[&conv].clone())
-                        } else {
-                            drop(con);
-                            let mut con = connections.write().await;
-                            match con.spare.iter().next() {
-                                Some((&src, _)) => {
-                                    let tcp_write: Arc<tokio::net::tcp::OwnedWriteHalf> =
-                                        con.spare.remove(&src).unwrap().into();
-                                    con.active.insert(conv, tcp_write.clone());
-                                    debug!("Assign TCP {} as {}", src, conv);
-                                    Some(tcp_write)
-                                }
-                                None => None,
-                            }
-                        }
-                    };
-                    if let Some(tcp_write) = tcp_write {
+                    let addr = packet.addr;
+                    if let Some(tcp_write) = connections.read().await.cons.get(&addr) {
                         loop {
                             match tcp_write.try_write(&packet.data) {
                                 Ok(n) => {
-                                    debug!("Forwarded {} bytes to TCP stream {}", n, conv);
+                                    debug!("Forwarded {} bytes to TCP stream {}", n, addr);
                                     break;
                                 }
                                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                                     tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                                 }
                                 Err(e) => {
-                                    error!("Failed to write to TCP stream {}: {}", conv, e);
-                                    connections.write().await.active.remove(&conv);
+                                    error!("Failed to write to TCP stream {}: {}", addr, e);
+                                    let mut con = connections.write().await;
+                                    if let Some(conv) = con.convs.remove(&addr) {
+                                        con.kcps.remove(&conv);
+                                    }
+                                    con.cons.remove(&addr);
                                     break;
                                 }
                             }
@@ -315,5 +417,6 @@ async fn main() -> io::Result<()> {
 
     tokio::signal::ctrl_c().await?;
     info!("Ctrl-C received, shutting down");
+    debug!("{:?}", connections.read().await);
     Ok(())
 }

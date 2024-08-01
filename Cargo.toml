@@ -4,10 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+byte_string = "1.0.0"
 clap = "4.5.9"
 env_logger = "0.11.5"
 futures = "0.3.30"
+futures-util = "0.3.30"
 kcp = "0.5.3"
 log = { version = "0.4", features = ["max_level_debug", "release_max_level_info"] }
 rand = "0.8.5"
+spin = "0.9.8"
 tokio = { version = "1", features = ["full"] }
