@@ -62,6 +62,40 @@ impl Debug for Connections {
     }
 }
 
+async fn assign_kcp(
+    connections: &Arc<RwLock<Connections>>,
+    conv: u32,
+    udp_tx: &mpsc::Sender<UDPPacket>,
+    tcp_tx: &mpsc::Sender<TCPPacket>,
+    is_client: bool,
+) -> Option<Arc<KcpSession>> {
+    let mut con = connections.write().await;
+    con.cons
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>()
+        .iter()
+        .find_map(|addr| {
+            if !con.convs.contains_key(addr) {
+                let config = Default::default();
+                let kcp =
+                    KcpSocket::new(&config, conv, KcpOutput::new(udp_tx.clone()), true).unwrap();
+                let session = KcpSession::new_shared(
+                    kcp,
+                    KcpRecv::new(tcp_tx.clone(), addr.clone()),
+                    config.session_expire,
+                    is_client,
+                );
+                con.convs.insert(addr.clone(), conv);
+                con.kcps.insert(conv, session.clone());
+                info!("Assign TCP {} as {}", addr, conv);
+                Some(session)
+            } else {
+                None
+            }
+        })
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let env = Env::default()
@@ -188,36 +222,7 @@ async fn main() -> io::Result<()> {
                                     Some(con.kcps[&conv].clone())
                                 } else {
                                     drop(con);
-                                    let mut con = connections.write().await;
-                                    con.cons
-                                        .keys()
-                                        .cloned()
-                                        .collect::<Vec<_>>()
-                                        .iter()
-                                        .find_map(|addr| {
-                                            if !con.convs.contains_key(addr) {
-                                                let config = Default::default();
-                                                let kcp = KcpSocket::new(
-                                                    &config,
-                                                    conv,
-                                                    KcpOutput::new(udp_tx.clone()),
-                                                    false,
-                                                )
-                                                .unwrap();
-                                                let session = KcpSession::new_shared(
-                                                    kcp,
-                                                    KcpRecv::new(tcp_tx.clone(), addr.clone()),
-                                                    config.session_expire,
-                                                    false,
-                                                );
-                                                con.convs.insert(addr.clone(), conv);
-                                                con.kcps.insert(conv, session.clone());
-                                                info!("Assign TCP {} as {}", addr, conv);
-                                                Some(session)
-                                            } else {
-                                                None
-                                            }
-                                        })
+                                    assign_kcp(&connections, conv, &udp_tx, &tcp_tx, false).await
                                 }
                             };
                             if let Some(session) = session {
@@ -276,46 +281,15 @@ async fn main() -> io::Result<()> {
                                                     Some(con.kcps[conv].clone())
                                                 } else {
                                                     drop(con);
-                                                    let mut con = connections.write().await;
                                                     let conv = rand::thread_rng().gen::<u32>();
-                                                    con.cons
-                                                        .keys()
-                                                        .cloned()
-                                                        .collect::<Vec<_>>()
-                                                        .iter()
-                                                        .find_map(|addr| {
-                                                            if !con.convs.contains_key(addr) {
-                                                                let config = Default::default();
-                                                                let kcp = KcpSocket::new(
-                                                                    &config,
-                                                                    conv,
-                                                                    KcpOutput::new(udp_tx.clone()),
-                                                                    false,
-                                                                )
-                                                                .unwrap();
-                                                                let session =
-                                                                    KcpSession::new_shared(
-                                                                        kcp,
-                                                                        KcpRecv::new(
-                                                                            tcp_tx.clone(),
-                                                                            addr.clone(),
-                                                                        ),
-                                                                        config.session_expire,
-                                                                        true,
-                                                                    );
-                                                                con.convs
-                                                                    .insert(addr.clone(), conv);
-                                                                con.kcps
-                                                                    .insert(conv, session.clone());
-                                                                info!(
-                                                                    "Assign TCP {} as {}",
-                                                                    addr, conv
-                                                                );
-                                                                Some(session)
-                                                            } else {
-                                                                None
-                                                            }
-                                                        })
+                                                    assign_kcp(
+                                                        &connections,
+                                                        conv,
+                                                        &udp_tx,
+                                                        &tcp_tx,
+                                                        true,
+                                                    )
+                                                    .await
                                                 }
                                             };
                                             if let Some(session) = session {

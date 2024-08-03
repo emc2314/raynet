@@ -1,5 +1,6 @@
 use std::{
     fmt::{self, Debug},
+    io::ErrorKind,
     ops::Deref,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -15,7 +16,10 @@ use kcp::KcpResult;
 use log::{debug, error, warn};
 use spin::Mutex as SpinMutex;
 use tokio::{
-    sync::{mpsc, Notify},
+    sync::{
+        mpsc::{self, error::TrySendError},
+        Notify,
+    },
     time::{self, Instant},
 };
 
@@ -94,76 +98,52 @@ impl KcpSession {
 
         let io_task_handle = {
             let session = session.clone();
-            let mut buf = vec![0u8; 65535];
             tokio::spawn(async move {
-                let mut next = Instant::now() + Duration::from_millis(1);
                 while !session.closed.load(Ordering::Relaxed) {
-                    tokio::select! {
-                            input_opt = input_rx.recv() => {
-                            if let Some(input_buffer) = input_opt {
-                                if input_buffer.len() < kcp::KCP_OVERHEAD {
-                                    error!(
-                                        "packet too short, received {} bytes, but at least {} bytes",
-                                        input_buffer.len(),
-                                        kcp::KCP_OVERHEAD
-                                    );
-                                    continue;
-                                }
+                    let input_opt = input_rx.recv().await;
+                    if let Some(input_buffer) = input_opt {
+                        if input_buffer.len() < kcp::KCP_OVERHEAD {
+                            error!(
+                                "packet too short, received {} bytes, but at least {} bytes",
+                                input_buffer.len(),
+                                kcp::KCP_OVERHEAD
+                            );
+                            continue;
+                        }
 
-                                let input_conv = kcp::get_conv(&input_buffer);
-                                debug!(
-                                    "[SESSION] UDP recv {} bytes, conv: {}, going to input {:?}",
-                                    input_buffer.len(),
-                                    input_conv,
-                                    ByteStr::new(&input_buffer)
-                                );
+                        let input_conv = kcp::get_conv(&input_buffer);
+                        debug!(
+                            "[SESSION] UDP recv {} bytes, conv: {}, going to input {:?}",
+                            input_buffer.len(),
+                            input_conv,
+                            ByteStr::new(&input_buffer)
+                        );
 
-                                let mut socket = session.socket.lock();
+                        let mut socket = session.socket.lock();
 
-                                // Server may allocate another conv for this client.
-                                if !socket.waiting_conv() && socket.conv() != input_conv {
-                                    warn!(
-                                        "[SESSION] UDP input conv: {} replaces session conv: {}",
-                                        input_conv,
-                                        socket.conv()
-                                    );
-                                    socket.set_conv(input_conv);
-                                }
+                        // Server may allocate another conv for this client.
+                        if !socket.waiting_conv() && socket.conv() != input_conv {
+                            warn!(
+                                "[SESSION] UDP input conv: {} replaces session conv: {}",
+                                input_conv,
+                                socket.conv()
+                            );
+                            socket.set_conv(input_conv);
+                        }
 
-                                match socket.input(&input_buffer) {
-                                    Ok(waked) => {
-                                        // debug!("[SESSION] UDP input {} bytes from channel {:?}",
-                                        //        input_buffer.len(), ByteStr::new(&input_buffer));
-                                        debug!("[SESSION] UDP input {} bytes from channel, waked? {} sender/receiver",
+                        match socket.input(&input_buffer) {
+                            Ok(waked) => {
+                                // debug!("[SESSION] UDP input {} bytes from channel {:?}",
+                                //        input_buffer.len(), ByteStr::new(&input_buffer));
+                                debug!("[SESSION] UDP input {} bytes from channel, waked? {} sender/receiver",
                                                        input_buffer.len(), waked);
-                                    }
-                                    Err(err) => {
-                                        error!("[SESSION] UDP input {} bytes from channel failed, error: {}, input buffer {:?}",
+                            }
+                            Err(err) => {
+                                error!("[SESSION] UDP input {} bytes from channel failed, error: {}, input buffer {:?}",
                                                        input_buffer.len(), err, ByteStr::new(&input_buffer));
-                                    }
-                                }
                             }
-                        },
-                        _ = time::sleep_until(next) => {
-                            let mut socket = session.socket.lock();
-                            while let Ok(size) = socket.peek_size() {
-                                if size == 0 {
-                                    break;
-                                }
-                                if buf.len() < size {
-                                    buf.resize(size, 0);
-                                }
-                                if let Ok(size) = socket.try_recv(&mut buf) {
-                                    if let Err(_) = session.recv.send(&buf[..size]).await {
-                                        error!("[SESSION] Recv thread send data failed");
-                                        socket.close();
-                                        session.close();
-                                        break;
-                                    }
-                                }
-                            }
-                            next = Instant::now() + Duration::from_millis(1);
-                        },
+                        }
+                        session.notify();
                     }
                 }
             })
@@ -173,6 +153,8 @@ impl KcpSession {
         {
             let session = session.clone();
             tokio::spawn(async move {
+                let mut recv_buffer = Vec::new();
+                let mut recv_buffer_size = 0;
                 while !session.closed.load(Ordering::Relaxed) {
                     let next = {
                         let mut socket = session.socket.lock();
@@ -227,6 +209,11 @@ impl KcpSession {
                         }
                     };
 
+                    if let Err(_) = session.recv(&mut recv_buffer, &mut recv_buffer_size).await {
+                        error!("[SESSION] Recv thread send data failed for session {}", session.conv());
+                        session.close();
+                    }
+
                     tokio::select! {
                         _ = time::sleep_until(next) => {},
                         _ = session.notifier.notified() => {},
@@ -255,6 +242,7 @@ impl KcpSession {
         session
     }
 
+    #[allow(dead_code)]
     pub fn kcp_socket(&self) -> &SpinMutex<KcpSocket> {
         &self.socket
     }
@@ -286,7 +274,7 @@ impl KcpSession {
 
     pub fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<KcpResult<usize>> {
         // Mutex doesn't have poll_lock, spinning on it.
-        let mut kcp = self.kcp_socket().lock();
+        let mut kcp = self.socket.lock();
         let result = ready!(kcp.poll_send(cx, buf));
         self.notify();
         result.into()
@@ -295,6 +283,58 @@ impl KcpSession {
     /// `send` data in `buf`
     pub async fn send(&self, buf: &[u8]) -> KcpResult<usize> {
         future::poll_fn(|cx| self.poll_send(cx, buf)).await
+    }
+
+    pub async fn recv(&self, recv_buffer: &mut Vec<u8>, recv_buffer_size: &mut usize) -> Result<(), ErrorKind> {
+        if *recv_buffer_size > 0 {
+            match self
+                .recv
+                .send(&recv_buffer[..*recv_buffer_size])
+                .await
+            {
+                Ok(_) => {
+                    debug!(
+                        "[SESSION] recv {} bytes and send to TCP",
+                        recv_buffer_size
+                    );
+                    *recv_buffer_size = 0;
+                }
+                Err(_) => {
+                    return Err(ErrorKind::BrokenPipe);
+                }
+            }
+        }
+        let mut socket = self.socket.lock();
+        while let Ok(size) = socket.peek_size() {
+            if size > 0 {
+                if recv_buffer.len() < size {
+                    recv_buffer.resize(size, 0);
+                }
+                if let Ok(size) = socket.try_recv(recv_buffer) {
+                    *recv_buffer_size = size;
+                    match self
+                        .recv
+                        .try_send(&recv_buffer[..*recv_buffer_size])
+                    {
+                        Ok(_) => {
+                            debug!(
+                                "[SESSION] recv {} bytes and send to TCP",
+                                recv_buffer_size
+                            );
+                            *recv_buffer_size = 0;
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            return Ok(());
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            return Err(ErrorKind::BrokenPipe);
+                        }
+                    }
+
+                }
+            }
+        }
+        Ok(())
     }
 }
 

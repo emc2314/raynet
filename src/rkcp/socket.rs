@@ -58,6 +58,7 @@ impl KcpNoDelayConfig {
     /// 2. Set ticking interval to be 40ms
     /// 3. Disable fast resend
     /// 4. Enable congestion control
+    #[allow(dead_code)]
     pub const fn normal() -> KcpNoDelayConfig {
         KcpNoDelayConfig {
             nodelay: false,
@@ -93,11 +94,11 @@ impl Default for KcpConfig {
             mtu: 1160,
             nodelay: KcpNoDelayConfig {
                 nodelay: true,
-                interval: 10,
+                interval: 5,
                 resend: 2,
                 nc: false,
             },
-            wnd_size: (2048, 2048),
+            wnd_size: (1024, 1024),
             session_expire: Some(Duration::from_secs(30)),
             flush_write: false,
             flush_acks_input: false,

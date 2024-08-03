@@ -84,4 +84,13 @@ impl KcpRecv {
             })
             .await
     }
+    pub fn try_send(
+        &self,
+        value: &[u8],
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<TCPPacket>> {
+        self.tx.try_send(TCPPacket {
+            data: value.to_vec(),
+            addr: self.addr,
+        })
+    }
 }
