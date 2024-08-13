@@ -341,11 +341,12 @@ async fn main() -> io::Result<()> {
                     while let Some(packet) = tcp_rx.recv().await {
                         let addr = packet.addr;
                         if let Some(tcp_write) = connections.read().await.cons.get(&addr) {
-                            loop {
-                                match tcp_write.try_write(&packet.data) {
+                            let mut data = packet.data.as_slice();
+                            while !data.is_empty() {
+                                match tcp_write.try_write(data) {
                                     Ok(n) => {
                                         debug!("Forwarded {} bytes to TCP stream {}", n, addr);
-                                        break;
+                                        data = &data[n..];
                                     }
                                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                                         sleep(Duration::from_millis(1)).await;

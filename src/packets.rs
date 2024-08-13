@@ -74,17 +74,10 @@ impl io::Write for KcpOutput {
 impl tokio::io::AsyncWrite for KcpOutput {
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        _: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
-        match self.tx.try_send(UDPPacket { data: buf.to_vec() }) {
-            Ok(_) => Poll::Ready(Ok(buf.len())),
-            Err(error::TrySendError::Full(_)) => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
-        }
+        Poll::Ready(<Self as std::io::Write>::write(self.get_mut(), buf))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
