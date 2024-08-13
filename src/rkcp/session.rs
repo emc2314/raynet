@@ -131,7 +131,7 @@ impl KcpSession {
                             socket.set_conv(input_conv);
                         }
 
-                        match socket.input(&input_buffer) {
+                        match socket.input(&input_buffer).await {
                             Ok(waked) => {
                                 // debug!("[SESSION] UDP input {} bytes from channel {:?}",
                                 //        input_buffer.len(), ByteStr::new(&input_buffer));
@@ -197,10 +197,12 @@ impl KcpSession {
 
                         // If window is full, flush it immediately
                         if socket.need_flush() {
-                            let _ = socket.flush();
+                            if let Err(e) = socket.flush().await {
+                                error!("[SESSION] Flush failed, error: {}", e);
+                            }
                         }
 
-                        match socket.update() {
+                        match socket.update().await {
                             Ok(next_next) => Instant::from_std(next_next),
                             Err(err) => {
                                 error!("[SESSION] KCP update failed, error: {}", err);
@@ -211,7 +213,7 @@ impl KcpSession {
 
                     if let Err(_) = session.recv(&mut recv_buffer, &mut recv_buffer_size).await {
                         error!("[SESSION] Recv thread send data failed for session {}", session.conv());
-                        session.close();
+                        break;
                     }
 
                     tokio::select! {
@@ -251,6 +253,7 @@ impl KcpSession {
         &self.recv
     }
 
+    #[allow(dead_code)]
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.notify();

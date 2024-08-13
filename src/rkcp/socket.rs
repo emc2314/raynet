@@ -94,14 +94,14 @@ impl Default for KcpConfig {
             mtu: 1160,
             nodelay: KcpNoDelayConfig {
                 nodelay: true,
-                interval: 5,
+                interval: 10,
                 resend: 2,
-                nc: false,
+                nc: true,
             },
             wnd_size: (1024, 1024),
             session_expire: Some(Duration::from_secs(30)),
-            flush_write: false,
-            flush_acks_input: false,
+            flush_write: true,
+            flush_acks_input: true,
             allow_recv_empty_packet: false,
         }
     }
@@ -167,7 +167,7 @@ impl KcpSocket {
     }
 
     /// Call every time you got data from transmission
-    pub fn input(&mut self, buf: &[u8]) -> KcpResult<bool> {
+    pub async fn input(&mut self, buf: &[u8]) -> KcpResult<bool> {
         match self.kcp.input(buf) {
             Ok(..) => {}
             Err(KcpError::ConvInconsistent(expected, actual)) => {
@@ -182,7 +182,7 @@ impl KcpSocket {
         self.last_update = Instant::now();
 
         if self.flush_ack_input {
-            self.kcp.flush_ack()?;
+            self.kcp.async_flush_ack().await?;
         }
 
         Ok(self.try_wake_pending_waker())
@@ -297,8 +297,8 @@ impl KcpSocket {
         future::poll_fn(|cx| self.poll_recv(cx, buf)).await
     }
 
-    pub fn flush(&mut self) -> KcpResult<()> {
-        self.kcp.flush()?;
+    pub async fn flush(&mut self) -> KcpResult<()> {
+        self.kcp.async_flush().await?;
         self.last_update = Instant::now();
         Ok(())
     }
@@ -331,9 +331,9 @@ impl KcpSocket {
         waked
     }
 
-    pub fn update(&mut self) -> KcpResult<Instant> {
+    pub async fn update(&mut self) -> KcpResult<Instant> {
         let now = now_millis();
-        self.kcp.update(now)?;
+        self.kcp.async_update(now).await?;
         let next = self.kcp.check(now);
 
         self.try_wake_pending_waker();

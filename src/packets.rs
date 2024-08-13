@@ -1,4 +1,7 @@
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::{io, net::SocketAddr};
+use tokio::sync::mpsc::{error, Sender};
 
 #[derive(Debug)]
 pub struct _RayPacket {
@@ -45,38 +48,64 @@ pub struct TCPPacket {
 
 #[derive(Debug)]
 pub struct KcpOutput {
-    tx: tokio::sync::mpsc::Sender<UDPPacket>,
+    tx: Sender<UDPPacket>,
 }
 impl KcpOutput {
-    pub fn new(tx: tokio::sync::mpsc::Sender<UDPPacket>) -> Self {
+    pub fn new(tx: Sender<UDPPacket>) -> Self {
         KcpOutput { tx }
     }
 }
-impl std::io::Write for KcpOutput {
+impl io::Write for KcpOutput {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.tx
-            .try_send(UDPPacket { data: buf.to_vec() })
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-            .map(|_| buf.len())
+        loop {
+            match self.tx.try_send(UDPPacket { data: buf.to_vec() }) {
+                Ok(_) => return Ok(buf.len()),
+                Err(error::TrySendError::Full(_)) => {
+                    std::thread::yield_now();
+                }
+                Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
+            }
+        }
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
+impl tokio::io::AsyncWrite for KcpOutput {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        match self.tx.try_send(UDPPacket { data: buf.to_vec() }) {
+            Ok(_) => Poll::Ready(Ok(buf.len())),
+            Err(error::TrySendError::Full(_)) => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
 
 #[derive(Debug)]
 pub struct KcpRecv {
-    tx: tokio::sync::mpsc::Sender<TCPPacket>,
+    tx: Sender<TCPPacket>,
     pub addr: SocketAddr,
 }
 impl KcpRecv {
-    pub fn new(tx: tokio::sync::mpsc::Sender<TCPPacket>, addr: SocketAddr) -> Self {
+    pub fn new(tx: Sender<TCPPacket>, addr: SocketAddr) -> Self {
         KcpRecv { tx, addr }
     }
-    pub async fn send(
-        &self,
-        value: &[u8],
-    ) -> Result<(), tokio::sync::mpsc::error::SendError<TCPPacket>> {
+    pub async fn send(&self, value: &[u8]) -> Result<(), error::SendError<TCPPacket>> {
         self.tx
             .send(TCPPacket {
                 data: value.to_vec(),
@@ -84,10 +113,7 @@ impl KcpRecv {
             })
             .await
     }
-    pub fn try_send(
-        &self,
-        value: &[u8],
-    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<TCPPacket>> {
+    pub fn try_send(&self, value: &[u8]) -> Result<(), error::TrySendError<TCPPacket>> {
         self.tx.try_send(TCPPacket {
             data: value.to_vec(),
             addr: self.addr,

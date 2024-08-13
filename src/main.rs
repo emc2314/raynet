@@ -15,6 +15,7 @@ use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::{sleep, Duration};
 
 mod packets;
 mod rkcp;
@@ -228,6 +229,7 @@ async fn main() -> io::Result<()> {
                             if let Some(session) = session {
                                 if let Err(_) = session.input(&buf[..size]).await {
                                     error!("KCP session {} closed when input", conv);
+                                    session.close();
                                     let mut con = connections.write().await;
                                     if let Some(conv) = con.convs.remove(&session.kcp_recv().addr) {
                                         con.kcps.remove(&conv);
@@ -293,10 +295,11 @@ async fn main() -> io::Result<()> {
                                                 }
                                             };
                                             if let Some(session) = session {
-                                                if let Err(_) = session.send(&buf[..len]).await {
+                                                if let Err(e) = session.send(&buf[..len]).await {
                                                     error!(
-                                                        "KCP session {} closed when send",
-                                                        session.conv()
+                                                        "KCP session {} error when send: {}",
+                                                        session.conv(),
+                                                        e
                                                     );
                                                     let mut con = connections.write().await;
                                                     if let Some(conv) = con.convs.remove(&src) {
@@ -308,10 +311,7 @@ async fn main() -> io::Result<()> {
                                             }
                                         }
                                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                            tokio::time::sleep(tokio::time::Duration::from_millis(
-                                                1,
-                                            ))
-                                            .await;
+                                            sleep(Duration::from_millis(1)).await;
                                         }
                                         Err(e) => {
                                             error!("Failed to read from TCP stream: {}", e);
@@ -333,58 +333,62 @@ async fn main() -> io::Result<()> {
             });
         }
         // Output thread
-        {
-            let connections = connections.clone();
-            tokio::spawn(async move {
-                while let Some(packet) = tcp_rx.recv().await {
-                    let addr = packet.addr;
-                    if let Some(tcp_write) = connections.read().await.cons.get(&addr) {
-                        loop {
-                            match tcp_write.try_write(&packet.data) {
-                                Ok(n) => {
-                                    debug!("Forwarded {} bytes to TCP stream {}", n, addr);
-                                    break;
-                                }
-                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                                }
-                                Err(e) => {
-                                    error!("Failed to write to TCP stream {}: {}", addr, e);
-                                    let mut con = connections.write().await;
-                                    if let Some(conv) = con.convs.remove(&addr) {
-                                        con.kcps.remove(&conv);
+        let connections = connections.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                tokio::spawn(async move {
+                    while let Some(packet) = tcp_rx.recv().await {
+                        let addr = packet.addr;
+                        if let Some(tcp_write) = connections.read().await.cons.get(&addr) {
+                            loop {
+                                match tcp_write.try_write(&packet.data) {
+                                    Ok(n) => {
+                                        debug!("Forwarded {} bytes to TCP stream {}", n, addr);
+                                        break;
                                     }
-                                    con.cons.remove(&addr);
-                                    break;
+                                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                        sleep(Duration::from_millis(1)).await;
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to write to TCP stream {}: {}", addr, e);
+                                        let mut con = connections.write().await;
+                                        if let Some(conv) = con.convs.remove(&addr) {
+                                            con.kcps.remove(&conv);
+                                        }
+                                        con.cons.remove(&addr);
+                                        break;
+                                    }
                                 }
                             }
+                        } else {
+                            error!("No spare connection");
                         }
-                    } else {
-                        error!("No spare connection");
                     }
-                }
+                });
+                tokio::spawn(async move {
+                    while let Some(packet) = udp_rx.recv().await {
+                        let mut cur = 0;
+                        while packet.data.len() > cur {
+                            let remote = send_addr.iter().choose(&mut rand::thread_rng()).unwrap();
+                            let udp_socket_out = udp_socket_outs
+                                .iter()
+                                .choose(&mut rand::thread_rng())
+                                .unwrap();
+                            let size = udp_socket_out
+                                .send_to(
+                                    &packet.data[cur..std::cmp::min(packet.data.len(), cur + 1200)],
+                                    remote,
+                                )
+                                .await
+                                .expect("Failed to send to UDP: {}");
+                            debug!("Sent {} bytes to UDP {}", size, remote);
+                            cur += size;
+                        }
+                    }
+                });
+                let _ = tokio::signal::ctrl_c().await;
             });
-        }
-        tokio::spawn(async move {
-            while let Some(packet) = udp_rx.recv().await {
-                let mut cur = 0;
-                while packet.data.len() > cur {
-                    let remote = send_addr.iter().choose(&mut rand::thread_rng()).unwrap();
-                    let udp_socket_out = udp_socket_outs
-                        .iter()
-                        .choose(&mut rand::thread_rng())
-                        .unwrap();
-                    let size = udp_socket_out
-                        .send_to(
-                            &packet.data[cur..std::cmp::min(packet.data.len(), cur + 1200)],
-                            remote,
-                        )
-                        .await
-                        .expect("Failed to send to UDP: {}");
-                    debug!("Sent {} bytes to UDP {}", size, remote);
-                    cur += size;
-                }
-            }
         });
         info!("Started RayNet Endpoint");
     }
