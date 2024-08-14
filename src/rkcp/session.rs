@@ -13,7 +13,7 @@ use std::{
 use byte_string::ByteStr;
 use futures_util::{future, ready};
 use kcp::KcpResult;
-use log::{debug, error, warn};
+use log::{debug, error, trace, warn};
 use spin::Mutex as SpinMutex;
 use tokio::{
     sync::{
@@ -113,18 +113,18 @@ impl KcpSession {
 
                         let input_conv = kcp::get_conv(&input_buffer);
                         debug!(
-                            "[SESSION] UDP recv {} bytes, conv: {}, going to input {:?}",
+                            "[SESSION] Input recv {} bytes, conv: {}",
                             input_buffer.len(),
-                            input_conv,
-                            ByteStr::new(&input_buffer)
+                            input_conv
                         );
+                        trace!("[SESSION] Input data {:?}", ByteStr::new(&input_buffer));
 
                         let mut socket = session.socket.lock();
 
                         // Server may allocate another conv for this client.
                         if !socket.waiting_conv() && socket.conv() != input_conv {
                             warn!(
-                                "[SESSION] UDP input conv: {} replaces session conv: {}",
+                                "[SESSION] Input input conv: {} replaces session conv: {}",
                                 input_conv,
                                 socket.conv()
                             );
@@ -133,13 +133,11 @@ impl KcpSession {
 
                         match socket.input(&input_buffer).await {
                             Ok(waked) => {
-                                // debug!("[SESSION] UDP input {} bytes from channel {:?}",
-                                //        input_buffer.len(), ByteStr::new(&input_buffer));
-                                debug!("[SESSION] UDP input {} bytes from channel, waked? {} sender/receiver",
+                                debug!("[SESSION] KCP input {} bytes from channel, waked? {} sender/receiver",
                                                        input_buffer.len(), waked);
                             }
                             Err(err) => {
-                                error!("[SESSION] UDP input {} bytes from channel failed, error: {}, input buffer {:?}",
+                                error!("[SESSION] KCP input {} bytes from channel failed, error: {}, input buffer {:?}",
                                                        input_buffer.len(), err, ByteStr::new(&input_buffer));
                             }
                         }
@@ -212,7 +210,10 @@ impl KcpSession {
                     };
 
                     if let Err(_) = session.recv(&mut recv_buffer, &mut recv_buffer_size).await {
-                        error!("[SESSION] Recv thread send data failed for session {}", session.conv());
+                        error!(
+                            "[SESSION] Recv thread send data failed for session {}",
+                            session.conv()
+                        );
                         break;
                     }
 
@@ -288,18 +289,15 @@ impl KcpSession {
         future::poll_fn(|cx| self.poll_send(cx, buf)).await
     }
 
-    pub async fn recv(&self, recv_buffer: &mut Vec<u8>, recv_buffer_size: &mut usize) -> Result<(), ErrorKind> {
+    pub async fn recv(
+        &self,
+        recv_buffer: &mut Vec<u8>,
+        recv_buffer_size: &mut usize,
+    ) -> Result<(), ErrorKind> {
         if *recv_buffer_size > 0 {
-            match self
-                .recv
-                .send(&recv_buffer[..*recv_buffer_size])
-                .await
-            {
+            match self.recv.send(&recv_buffer[..*recv_buffer_size]).await {
                 Ok(_) => {
-                    debug!(
-                        "[SESSION] recv {} bytes and send to TCP",
-                        recv_buffer_size
-                    );
+                    debug!("[SESSION] recv {} bytes and send to TCP", recv_buffer_size);
                     *recv_buffer_size = 0;
                 }
                 Err(_) => {
@@ -315,15 +313,9 @@ impl KcpSession {
                 }
                 if let Ok(size) = socket.try_recv(recv_buffer) {
                     *recv_buffer_size = size;
-                    match self
-                        .recv
-                        .try_send(&recv_buffer[..*recv_buffer_size])
-                    {
+                    match self.recv.try_send(&recv_buffer[..*recv_buffer_size]) {
                         Ok(_) => {
-                            debug!(
-                                "[SESSION] recv {} bytes and send to TCP",
-                                recv_buffer_size
-                            );
+                            debug!("[SESSION] recv {} bytes and send to TCP", recv_buffer_size);
                             *recv_buffer_size = 0;
                         }
                         Err(TrySendError::Full(_)) => {
@@ -333,7 +325,6 @@ impl KcpSession {
                             return Err(ErrorKind::BrokenPipe);
                         }
                     }
-
                 }
             }
         }
