@@ -9,17 +9,17 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, RwLock};
 
 mod connections;
+mod local;
 mod packets;
+mod remote;
 mod rkcp;
 mod routing;
-mod tcp;
-mod udp;
 mod utils;
 
 use connections::Connections;
+use local::{endpoint_from, endpoint_to};
 use packets::{TCPPacket, UDPPacket};
-use udp::{endpoint_in, endpoint_out, forward_in, forward_out};
-use tcp::{endpoint_from, endpoint_to};
+use remote::{endpoint_in, endpoint_out, forward_in, forward_out};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -92,8 +92,7 @@ async fn main() -> io::Result<()> {
     if !matches.get_flag("endpoint") {
         // Input thread
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 65535];
-            forward_in(udp_socket, &mut buf, udp_tx).await;
+            forward_in(udp_socket, udp_tx).await;
         });
 
         // Output thread
@@ -110,8 +109,7 @@ async fn main() -> io::Result<()> {
             let udp_tx = udp_tx.clone();
             let tcp_tx = tcp_tx.clone();
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 65535];
-                endpoint_in(udp_socket, &mut buf, udp_tx, connections, tcp_tx).await;
+                endpoint_in(udp_socket, udp_tx, connections, tcp_tx).await;
             });
         }
 

@@ -38,7 +38,7 @@ pub struct KcpSession {
 
 impl Drop for KcpSession {
     fn drop(&mut self) {
-        debug!(
+        warn!(
             "[SESSION] KcpSession conv {} is dropping, closed? {}",
             self.socket.lock().conv(),
             self.closed.load(Ordering::Acquire),
@@ -142,7 +142,14 @@ impl KcpSession {
                             }
                         }
                         session.notify();
+                    } else {
+                        break;
                     }
+                }
+                if !session.closed.load(Ordering::Relaxed) {
+                    error!("[SESSION] KCP input thread closed");
+                    session.closed.store(true, Ordering::Release);
+                    session.notify();
                 }
             })
         };
@@ -159,7 +166,7 @@ impl KcpSession {
 
                         let is_closed = session.closed.load(Ordering::Acquire);
                         if is_closed && socket.can_close() {
-                            debug!("[SESSION] KCP session closing");
+                            warn!("[SESSION] KCP session closing");
                             break;
                         }
 
@@ -182,7 +189,7 @@ impl KcpSession {
                                     }
 
                                     if !is_closed {
-                                        debug!(
+                                        warn!(
                                             "[SESSION] closing inactive session, conv: {}, last_update: {}s ago",
                                             socket.conv(),
                                             elapsed.as_secs()
@@ -238,7 +245,7 @@ impl KcpSession {
                 session.closed.store(true, Ordering::Release);
                 io_task_handle.abort();
 
-                debug!("[SESSION] KCP session closed");
+                warn!("[SESSION] KCP session closed");
             });
         }
 
@@ -252,6 +259,10 @@ impl KcpSession {
 
     pub fn kcp_recv(&self) -> &KcpRecv {
         &self.recv
+    }
+
+    pub fn closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     #[allow(dead_code)]

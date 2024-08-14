@@ -5,12 +5,13 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, RwLock};
 
-use crate::connections::{assign_kcp, Connections};
+use crate::connections::Connections;
 use crate::packets::{TCPPacket, UDPPacket};
 
-pub async fn forward_in(udp_socket: UdpSocket, buf: &mut [u8], udp_tx: mpsc::Sender<UDPPacket>) {
+pub async fn forward_in(udp_socket: UdpSocket, udp_tx: mpsc::Sender<UDPPacket>) {
+    let mut buf = vec![0u8; 65535];
     loop {
-        match udp_socket.recv_from(buf).await {
+        match udp_socket.recv_from(&mut buf).await {
             Ok((size, src)) => {
                 debug!("Received {} bytes from {}", size, src);
                 if let Err(e) = udp_tx
@@ -47,33 +48,34 @@ pub async fn forward_out(
 
 pub async fn endpoint_in(
     udp_socket: UdpSocket,
-    buf: &mut [u8],
     udp_tx: mpsc::Sender<UDPPacket>,
     connections: Arc<RwLock<Connections>>,
     tcp_tx: mpsc::Sender<TCPPacket>,
 ) {
+    let mut buf = vec![0u8; 65535];
     loop {
-        match udp_socket.recv_from(buf).await {
+        match udp_socket.recv_from(&mut buf).await {
             Ok((size, src)) => {
                 debug!("Received {} bytes from UDP {}", size, src);
-                let conv = kcp::get_conv(buf);
+                let conv = kcp::get_conv(&buf);
                 let session = {
                     let con = connections.read().await;
-                    if con.kcps.contains_key(&conv) {
-                        Some(con.kcps[&conv].clone())
+                    if let Some(kcp) = con.get_from_conv(conv) {
+                        Some(kcp)
                     } else {
                         drop(con);
-                        assign_kcp(&connections, conv, &udp_tx, &tcp_tx, false).await
+                        connections
+                            .write()
+                            .await
+                            .assign_from_conv(conv, &udp_tx, &tcp_tx)
+                            .await
                     }
                 };
                 if let Some(session) = session {
                     if let Err(_) = session.input(&buf[..size]).await {
                         error!("KCP session {} closed when input", conv);
                         session.close();
-                        let mut con = connections.write().await;
-                        if let Some(conv) = con.convs.remove(&session.kcp_recv().addr) {
-                            con.kcps.remove(&conv);
-                        }
+                        connections.write().await.close(&session.kcp_recv().addr);
                     }
                 } else {
                     error!("No spare connection");

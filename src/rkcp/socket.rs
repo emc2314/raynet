@@ -1,4 +1,5 @@
 use std::{
+    fmt::{self, Debug},
     io::{self, ErrorKind, Write},
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
@@ -124,7 +125,6 @@ impl KcpConfig {
     }
 }
 
-#[derive(Debug)]
 pub struct KcpSocket {
     kcp: Kcp<KcpOutput>,
     last_update: Instant,
@@ -135,6 +135,23 @@ pub struct KcpSocket {
     pending_receiver: Option<Waker>,
     closed: bool,
     allow_recv_empty_packet: bool,
+}
+
+impl Debug for KcpSocket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KcpSession")
+            .field("kcp.conv", &self.kcp.conv())
+            .field("kcp.dead", &self.kcp.is_dead_link())
+            .field("last_update", &self.last_update)
+            .field("flush_write", &self.flush_write)
+            .field("flush_ack_input", &self.flush_ack_input)
+            .field("sent_first", &self.sent_first)
+            .field("pending_sender", &self.pending_sender.is_some())
+            .field("pending_receiver", &self.pending_receiver.is_some())
+            .field("closed", &self.closed)
+            .field("allow_recv_empty_packet", &self.allow_recv_empty_packet)
+            .finish()
+    }
 }
 
 impl KcpSocket {
