@@ -58,6 +58,14 @@ async fn main() -> io::Result<()> {
                 .help("Indicate endpoint")
                 .num_args(0),
         )
+        .arg(
+            Arg::new("key")
+                .short('k')
+                .long("key")
+                .help("Pre shared key")
+                .num_args(1)
+                .default_value("19260817"),
+        )
         .get_matches();
 
     let listen_addr: SocketAddr = matches
@@ -77,7 +85,12 @@ async fn main() -> io::Result<()> {
                 .unwrap()
         })
         .collect::<Vec<SocketAddr>>();
-    let key = core::array::from_fn(|i| i as u8);
+    let key = blake3::derive_key(
+        "RayNet PSK v1",
+        matches.get_one::<String>("key").unwrap().as_bytes(),
+    )[..16]
+        .try_into()
+        .unwrap();
 
     let connections = Arc::new(RwLock::new(Connections::new()));
     let udp_socket = UdpSocket::bind(listen_addr).await?;
@@ -93,12 +106,12 @@ async fn main() -> io::Result<()> {
         let (ray_tx, mut ray_rx) = mpsc::channel::<RayPacket>(65536);
         // Input thread
         tokio::spawn(async move {
-            forward_in(udp_socket, ray_tx, key).await;
+            forward_in(udp_socket, ray_tx, &key).await;
         });
 
         // Output thread
         tokio::spawn(async move {
-            forward_out(udp_socket_outs, &mut ray_rx, send_addr, key).await;
+            forward_out(udp_socket_outs, &mut ray_rx, send_addr, &key).await;
         });
         info!("Started RayNet Forwarder");
     } else {
@@ -111,7 +124,7 @@ async fn main() -> io::Result<()> {
             let kcp_tx = kcp_tx.clone();
             let tcp_tx = tcp_tx.clone();
             tokio::spawn(async move {
-                endpoint_in(udp_socket, kcp_tx, connections, tcp_tx, key).await;
+                endpoint_in(udp_socket, kcp_tx, connections, tcp_tx, &key).await;
             });
         }
 
@@ -132,7 +145,7 @@ async fn main() -> io::Result<()> {
                     endpoint_to(connections, &mut tcp_rx).await;
                 });
                 tokio::spawn(async move {
-                    endpoint_out(udp_socket_outs, &mut kcp_rx, send_addr, key).await;
+                    endpoint_out(udp_socket_outs, &mut kcp_rx, send_addr, &key).await;
                 });
                 let _ = tokio::signal::ctrl_c().await;
             });

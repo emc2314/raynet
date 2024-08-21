@@ -9,13 +9,13 @@ use tokio::sync::{mpsc, RwLock};
 use crate::connections::Connections;
 use crate::packets::{KCPPacket, RayPacket, TCPPacket};
 
-pub async fn forward_in(udp_socket: UdpSocket, ray_tx: mpsc::Sender<RayPacket>, key: Key) {
+pub async fn forward_in(udp_socket: UdpSocket, ray_tx: mpsc::Sender<RayPacket>, key: &Key) {
     let mut buf = vec![0u8; 65535];
     loop {
         match udp_socket.recv_from(&mut buf).await {
             Ok((size, src)) => {
                 debug!("Received {} bytes from {}", size, src);
-                match RayPacket::decrypt(&key, &mut buf[..size]) {
+                match RayPacket::decrypt(key, &mut buf[..size]) {
                     Ok(p) => {
                         if let Err(e) = ray_tx.send(p).await {
                             error!("Failed to send to channel: {}", e);
@@ -35,11 +35,11 @@ pub async fn forward_out(
     udp_socket_outs: Vec<UdpSocket>,
     ray_rx: &mut mpsc::Receiver<RayPacket>,
     send_addr: Vec<SocketAddr>,
-    key: Key,
+    key: &Key,
 ) {
     let mut buf = vec![0u8; 65535];
     while let Some(packet) = ray_rx.recv().await {
-        let rsize = packet.encrypt(&key, &mut buf);
+        let rsize = packet.encrypt(key, &mut buf);
         let remote = send_addr.iter().choose(&mut rand::thread_rng()).unwrap();
         let udp_socket_out = udp_socket_outs
             .iter()
@@ -57,14 +57,14 @@ pub async fn endpoint_in(
     kcp_tx: mpsc::Sender<KCPPacket>,
     connections: Arc<RwLock<Connections>>,
     tcp_tx: mpsc::Sender<TCPPacket>,
-    key: Key,
+    key: &Key,
 ) {
     let mut buf = vec![0u8; 65535];
     loop {
         match udp_socket.recv_from(&mut buf).await {
             Ok((size, src)) => {
                 debug!("Received {} bytes from UDP {}", size, src);
-                match RayPacket::decrypt(&key, &mut buf[..size]) {
+                match RayPacket::decrypt(key, &mut buf[..size]) {
                     Ok(packet) => {
                         let packet = packet.kcp;
                         let conv = kcp::get_conv(&packet.data);
@@ -105,12 +105,12 @@ pub async fn endpoint_out(
     udp_socket_outs: Vec<UdpSocket>,
     kcp_rx: &mut mpsc::Receiver<KCPPacket>,
     send_addr: Vec<SocketAddr>,
-    key: Key,
+    key: &Key,
 ) {
     let mut buf = vec![0u8; 65535];
     while let Some(packet) = kcp_rx.recv().await {
         let packet = RayPacket::new(0, 0, 0, packet);
-        let rsize = packet.encrypt(&key, &mut buf);
+        let rsize = packet.encrypt(key, &mut buf);
         let remote = send_addr.iter().choose(&mut rand::thread_rng()).unwrap();
         let udp_socket_out = udp_socket_outs
             .iter()
