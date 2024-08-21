@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
-use crate::packets::{KcpOutput, KcpRecv, TCPPacket, UDPPacket};
+use crate::packets::{KCPPacket, KcpOutput, KcpRecv, TCPPacket};
 use crate::rkcp::session::KcpSession;
 use crate::rkcp::socket::KcpSocket;
 use crate::utils::UnwrapNone;
@@ -28,7 +28,7 @@ impl Connections {
     pub async fn assign_from_conv(
         self: &mut Connections,
         conv: u32,
-        udp_tx: &Sender<UDPPacket>,
+        kcp_tx: &Sender<KCPPacket>,
         tcp_tx: &Sender<TCPPacket>,
     ) -> Option<Arc<KcpSession>> {
         self.cons
@@ -47,7 +47,7 @@ impl Connections {
                 }
                 let config = Default::default();
                 let kcp =
-                    KcpSocket::new(&config, conv, KcpOutput::new(udp_tx.clone()), true).unwrap();
+                    KcpSocket::new(&config, conv, KcpOutput::new(kcp_tx.clone()), true).unwrap();
                 let session = KcpSession::new_shared(
                     kcp,
                     KcpRecv::new(tcp_tx.clone(), addr.clone()),
@@ -64,12 +64,12 @@ impl Connections {
     pub async fn assign_from_addr(
         self: &mut Connections,
         addr: &SocketAddr,
-        udp_tx: &Sender<UDPPacket>,
+        kcp_tx: &Sender<KCPPacket>,
         tcp_tx: &Sender<TCPPacket>,
     ) -> Arc<KcpSession> {
         let conv = rand::thread_rng().gen::<u32>();
         let config = Default::default();
-        let kcp = KcpSocket::new(&config, conv, KcpOutput::new(udp_tx.clone()), true).unwrap();
+        let kcp = KcpSocket::new(&config, conv, KcpOutput::new(kcp_tx.clone()), true).unwrap();
         let session = KcpSession::new_shared(
             kcp,
             KcpRecv::new(tcp_tx.clone(), addr.clone()),

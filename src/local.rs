@@ -6,11 +6,11 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::time::{sleep, Duration};
 
 use crate::connections::Connections;
-use crate::packets::{TCPPacket, UDPPacket};
+use crate::packets::{KCPPacket, TCPPacket};
 
 pub async fn endpoint_from(
     tcp_listener: TcpListener,
-    udp_tx: mpsc::Sender<UDPPacket>,
+    kcp_tx: mpsc::Sender<KCPPacket>,
     connections: Arc<RwLock<Connections>>,
     tcp_tx: mpsc::Sender<TCPPacket>,
 ) {
@@ -24,7 +24,7 @@ pub async fn endpoint_from(
                 }
 
                 let connections = connections.clone();
-                let udp_tx = udp_tx.clone();
+                let kcp_tx = kcp_tx.clone();
                 let tcp_tx = tcp_tx.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 65535];
@@ -46,7 +46,7 @@ pub async fn endpoint_from(
                                         connections
                                             .write()
                                             .await
-                                            .assign_from_addr(&src, &udp_tx, &tcp_tx)
+                                            .assign_from_addr(&src, &kcp_tx, &tcp_tx)
                                             .await
                                     }
                                 };

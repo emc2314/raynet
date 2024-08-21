@@ -1,42 +1,78 @@
+use aegis::aegis128l::{Aegis128L, Key, Nonce, Tag};
+use rand::Rng;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::{io, net::SocketAddr};
 use tokio::sync::mpsc::{error, Sender};
 
+use crate::utils::now_millis;
+
 #[derive(Debug)]
-pub struct _RayPacket {
+pub struct RayPacket {
     flag: u8,
     src: u8,
     dst: u8,
-    iv: [u8; 16],
-    data: Vec<u8>,
+    nonce: Nonce,
+    pub kcp: KCPPacket,
 }
-impl _RayPacket {
-    fn _from_buf(bytes: &Vec<u8>) -> Result<Self, &'static str> {
-        if bytes.len() < 21 {
-            return Err("Buf too short");
+impl RayPacket {
+    pub fn new(flag: u8, src: u8, dst: u8, kcp: KCPPacket) -> Self {
+        RayPacket {
+            flag,
+            src,
+            dst,
+            nonce: rand::thread_rng().gen(),
+            kcp,
         }
-        Ok(_RayPacket {
-            flag: bytes[0],
-            src: bytes[1],
-            dst: bytes[2],
-            iv: bytes[5..21].try_into().unwrap(),
-            data: bytes[21..].to_vec(),
-        })
     }
-    fn _to_buf(&self) -> Vec<u8> {
-        let mut buf = vec![0u8; 21 + self.data.len()];
-        buf[0] = self.flag;
-        buf[1] = self.src;
-        buf[2] = self.dst;
-        buf[5..21].copy_from_slice(&self.iv);
-        buf[21..].copy_from_slice(&self.data);
-        buf
+    pub fn encrypt(&self, key: &Key, out: &mut [u8]) -> usize {
+        let cipher = Aegis128L::new(key, &self.nonce);
+        let rsize = self.kcp.data.len() + 35;
+        out[0..16].copy_from_slice(&self.nonce);
+        out[32] = self.flag;
+        out[33] = self.src;
+        out[34] = self.dst;
+        out[35..rsize].copy_from_slice(&self.kcp.data);
+        let ad = (now_millis() >> 16).to_le_bytes();
+        let tag: Tag<16> = cipher.encrypt_in_place(&mut out[32..rsize], &ad);
+        out[16..32].copy_from_slice(&tag);
+        rsize
+    }
+    pub fn decrypt(key: &Key, data: &mut [u8]) -> Result<Self, RayPacketError> {
+        if data.len() < 35 {
+            return Err(RayPacketError::BufTooShortError);
+        }
+        let nonce = data[0..16].try_into().unwrap();
+        let tag: Tag<16> = data[16..32].try_into().unwrap();
+        let cipher = Aegis128L::new(key, &nonce);
+        let ts = now_millis();
+        let ad = (ts >> 16).to_le_bytes();
+        cipher
+            .decrypt_in_place(&mut data[32..], &tag, &ad)
+            .or_else(|_| {
+                let adjusted_ts = if (ts & 0x8000) == 0 {
+                    ts - 0x8000
+                } else {
+                    ts + 0x8000
+                };
+                let adjusted_ad = (adjusted_ts >> 16).to_le_bytes();
+                cipher.decrypt_in_place(&mut data[32..], &tag, &adjusted_ad)
+            })
+            .map(|()| RayPacket {
+                flag: data[32],
+                src: data[33],
+                dst: data[34],
+                nonce,
+                kcp: KCPPacket {
+                    data: data[35..].to_vec(),
+                },
+            })
+            .map_err(|e| RayPacketError::DecryptError(e))
     }
 }
 
 #[derive(Debug)]
-pub struct UDPPacket {
+pub struct KCPPacket {
     pub data: Vec<u8>,
 }
 
@@ -48,17 +84,17 @@ pub struct TCPPacket {
 
 #[derive(Debug)]
 pub struct KcpOutput {
-    tx: Sender<UDPPacket>,
+    tx: Sender<KCPPacket>,
 }
 impl KcpOutput {
-    pub fn new(tx: Sender<UDPPacket>) -> Self {
+    pub fn new(tx: Sender<KCPPacket>) -> Self {
         KcpOutput { tx }
     }
 }
 impl io::Write for KcpOutput {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         loop {
-            match self.tx.try_send(UDPPacket { data: buf.to_vec() }) {
+            match self.tx.try_send(KCPPacket { data: buf.to_vec() }) {
                 Ok(_) => return Ok(buf.len()),
                 Err(error::TrySendError::Full(_)) => {
                     std::thread::yield_now();
@@ -112,4 +148,9 @@ impl KcpRecv {
             addr: self.addr,
         })
     }
+}
+
+pub enum RayPacketError {
+    BufTooShortError,
+    DecryptError(aegis::Error),
 }

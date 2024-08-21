@@ -168,7 +168,7 @@ impl KcpSocket {
             kcp.input_conv();
         }
 
-        kcp.update(now_millis())?;
+        kcp.update(now_millis() as u32)?;
 
         Ok(KcpSocket {
             kcp,
@@ -349,7 +349,7 @@ impl KcpSocket {
     }
 
     pub async fn update(&mut self) -> KcpResult<Instant> {
-        let now = now_millis();
+        let now = now_millis() as u32;
         self.kcp.async_update(now).await?;
         let next = self.kcp.check(now);
 
