@@ -12,7 +12,6 @@ pub struct RayPacket {
     flag: u8,
     src: u8,
     dst: u8,
-    nonce: Nonce,
     pub kcp: KCPPacket,
 }
 impl RayPacket {
@@ -21,14 +20,14 @@ impl RayPacket {
             flag,
             src,
             dst,
-            nonce: rand::thread_rng().gen(),
             kcp,
         }
     }
     pub fn encrypt(&self, key: &Key, out: &mut [u8]) -> usize {
-        let cipher = Aegis128L::new(key, &self.nonce);
+        let nonce: Nonce = rand::thread_rng().gen();
+        let cipher = Aegis128L::new(key, &nonce);
         let rsize = self.kcp.data.len() + 35;
-        out[0..16].copy_from_slice(&self.nonce);
+        out[0..16].copy_from_slice(&nonce);
         out[32] = self.flag;
         out[33] = self.src;
         out[34] = self.dst;
@@ -38,7 +37,7 @@ impl RayPacket {
         out[16..32].copy_from_slice(&tag);
         rsize
     }
-    pub fn decrypt(key: &Key, data: &mut [u8]) -> Result<Self, RayPacketError> {
+    pub fn decrypt(key: &Key, data: &[u8]) -> Result<Self, RayPacketError> {
         if data.len() < 35 {
             return Err(RayPacketError::BufTooShortError);
         }
@@ -48,7 +47,7 @@ impl RayPacket {
         let ts = now_millis();
         let ad = (ts >> 16).to_le_bytes();
         cipher
-            .decrypt_in_place(&mut data[32..], &tag, &ad)
+            .decrypt(&data[32..], &tag, &ad)
             .or_else(|_| {
                 let adjusted_ts = if (ts & 0x8000) == 0 {
                     ts - 0x8000
@@ -56,15 +55,14 @@ impl RayPacket {
                     ts + 0x8000
                 };
                 let adjusted_ad = (adjusted_ts >> 16).to_le_bytes();
-                cipher.decrypt_in_place(&mut data[32..], &tag, &adjusted_ad)
+                cipher.decrypt(&data[32..], &tag, &adjusted_ad)
             })
-            .map(|()| RayPacket {
-                flag: data[32],
-                src: data[33],
-                dst: data[34],
-                nonce,
+            .map(|m| RayPacket {
+                flag: m[0],
+                src: m[1],
+                dst: m[2],
                 kcp: KCPPacket {
-                    data: data[35..].to_vec(),
+                    data: m[3..].to_vec(),
                 },
             })
             .map_err(|e| RayPacketError::DecryptError(e))
