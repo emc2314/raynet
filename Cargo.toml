@@ -7,7 +7,7 @@ edition = "2021"
 aegis = "0.6.6"
 blake3 = "1.5.4"
 byte_string = "1.0.0"
-clap = "4.5.9"
+clap = "4.5.16"
 env_logger = "0.11.5"
 futures = "0.3.30"
 futures-util = "0.3.30"
@@ -16,3 +16,6 @@ log = { version = "0.4", features = ["max_level_debug", "release_max_level_info"
 rand = "0.8.5"
 spin = "0.9.8"
 tokio = { version = "1", features = ["full"] }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
