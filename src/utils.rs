@@ -1,5 +1,10 @@
 use core::fmt;
+use fastbloom::BloomFilter;
+use std::hash::Hash;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
+use tokio::time::{interval, Duration};
 
 #[inline]
 pub fn now_millis() -> u64 {
@@ -57,4 +62,46 @@ where
 #[track_caller]
 fn expect_none_failed(msg: &str, value: &dyn fmt::Debug) -> ! {
     panic!("{}: {:?}", msg, value)
+}
+
+pub struct NonceFilter {
+    filter: Arc<RwLock<(BloomFilter, BloomFilter)>>,
+}
+
+impl NonceFilter {
+    pub fn new(size: usize, p_false: f64, timeout: Duration) -> Arc<Self> {
+        let checker = Arc::new(NonceFilter {
+            filter: Arc::new(RwLock::new((
+                BloomFilter::with_false_pos(p_false).expected_items(size),
+                BloomFilter::with_false_pos(p_false).expected_items(size),
+            ))),
+        });
+
+        let checker_clone = checker.clone();
+        tokio::spawn(async move {
+            let mut interval = interval(timeout);
+            loop {
+                interval.tick().await;
+
+                let mut filter = checker_clone.filter.write().await;
+                let (curr, prev) = &mut *filter;
+                std::mem::swap(curr, prev);
+                filter.0.clear();
+            }
+        });
+
+        checker
+    }
+
+    pub async fn check_and_set<T: Hash + ?Sized>(&self, nonce: &T) -> bool {
+        {
+            let (curr, prev) = &*self.filter.read().await;
+            if curr.contains(nonce) || prev.contains(nonce) {
+                return false;
+            }
+        }
+
+        self.filter.write().await.0.insert(nonce);
+        true
+    }
 }

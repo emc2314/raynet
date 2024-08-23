@@ -5,21 +5,27 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::Duration;
 
 use crate::connections::Connections;
-use crate::packets::{KCPPacket, RayPacket, TCPPacket};
+use crate::packets::{KCPPacket, RayPacket, RayPacketError, TCPPacket};
+use crate::utils::NonceFilter;
 
 pub async fn forward_in(udp_socket: UdpSocket, ray_tx: mpsc::Sender<RayPacket>, key: &Key) {
     let mut buf = vec![0u8; 65535];
+    let filter = NonceFilter::new(1 << 24, 0.00001, Duration::from_millis(1 << 16));
     loop {
         match udp_socket.recv_from(&mut buf).await {
             Ok((size, src)) => {
                 debug!("Received {} bytes from {}", size, src);
-                match RayPacket::decrypt(key, &mut buf[..size]) {
+                match RayPacket::decrypt(key, &mut buf[..size], filter.clone()).await {
                     Ok(p) => {
                         if let Err(e) = ray_tx.send(p).await {
                             error!("Failed to send to channel: {}", e);
                         }
+                    }
+                    Err(RayPacketError::NonceReuseError) => {
+                        warn!("Duplicated nonce from {}", src);
                     }
                     Err(_) => {
                         warn!("Invalid packet received from {}", src);
@@ -60,11 +66,12 @@ pub async fn endpoint_in(
     key: &Key,
 ) {
     let mut buf = vec![0u8; 65535];
+    let filter = NonceFilter::new(1 << 24, 0.00001, Duration::from_millis(1 << 16));
     loop {
         match udp_socket.recv_from(&mut buf).await {
             Ok((size, src)) => {
                 debug!("Received {} bytes from UDP {}", size, src);
-                match RayPacket::decrypt(key, &mut buf[..size]) {
+                match RayPacket::decrypt(key, &mut buf[..size], filter.clone()).await {
                     Ok(packet) => {
                         let packet = packet.kcp;
                         let conv = kcp::get_conv(&packet.data);
@@ -90,6 +97,9 @@ pub async fn endpoint_in(
                         } else {
                             error!("No spare connection");
                         }
+                    }
+                    Err(RayPacketError::NonceReuseError) => {
+                        warn!("Duplicated nonce from {}", src);
                     }
                     Err(_) => {
                         warn!("Invalid packet received from {}", src);

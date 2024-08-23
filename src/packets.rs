@@ -1,11 +1,12 @@
 use aegis::aegis128l::{Aegis128L, Key, Nonce, Tag};
 use rand::Rng;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::{io, net::SocketAddr};
 use tokio::sync::mpsc::{error, Sender};
 
-use crate::utils::now_millis;
+use crate::utils::{now_millis, NonceFilter};
 
 #[derive(Debug)]
 pub struct RayPacket {
@@ -32,29 +33,36 @@ impl RayPacket {
         out[33] = self.src;
         out[34] = self.dst;
         out[35..rsize].copy_from_slice(&self.kcp.data);
-        let ad = (now_millis() >> 16).to_le_bytes();
+        let ad = (now_millis() >> 15).to_le_bytes();
         let tag: Tag<16> = cipher.encrypt_in_place(&mut out[32..rsize], &ad);
         out[16..32].copy_from_slice(&tag);
         rsize
     }
-    pub fn decrypt(key: &Key, data: &[u8]) -> Result<Self, RayPacketError> {
-        if data.len() < 35 {
-            return Err(RayPacketError::BufTooShortError);
+    pub async fn decrypt(
+        key: &Key,
+        data: &[u8],
+        filter: Arc<NonceFilter>,
+    ) -> Result<Self, RayPacketError> {
+        if data.len() < 35 || data.len() > 4096 {
+            return Err(RayPacketError::BufLengthError);
         }
         let nonce = data[0..16].try_into().unwrap();
+        if !filter.check_and_set(nonce).await {
+            return Err(RayPacketError::NonceReuseError);
+        }
         let tag: Tag<16> = data[16..32].try_into().unwrap();
         let cipher = Aegis128L::new(key, &nonce);
         let ts = now_millis();
-        let ad = (ts >> 16).to_le_bytes();
+        let ad = (ts >> 15).to_le_bytes();
         cipher
             .decrypt(&data[32..], &tag, &ad)
             .or_else(|_| {
-                let adjusted_ts = if (ts & 0x8000) == 0 {
-                    ts - 0x8000
+                let adjusted_ts = if (ts & 0x4000) == 0 {
+                    ts - 0x4000
                 } else {
-                    ts + 0x8000
+                    ts + 0x4000
                 };
-                let adjusted_ad = (adjusted_ts >> 16).to_le_bytes();
+                let adjusted_ad = (adjusted_ts >> 15).to_le_bytes();
                 cipher.decrypt(&data[32..], &tag, &adjusted_ad)
             })
             .map(|m| RayPacket {
@@ -149,6 +157,7 @@ impl KcpRecv {
 }
 
 pub enum RayPacketError {
-    BufTooShortError,
+    BufLengthError,
+    NonceReuseError,
     DecryptError(aegis::Error),
 }
