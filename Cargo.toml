@@ -12,7 +12,7 @@ env_logger = "0.11.5"
 fastbloom = "0.7.1"
 futures = "0.3.30"
 futures-util = "0.3.30"
-kcp = { git = "https://github.com/Matrix-Zhang/kcp.git", features = ["tokio"] }
+kcp = { git = "https://github.com/emc2314/kcp.git", features = ["tokio"] }
 log = { version = "0.4", features = [
     "max_level_debug",
     "release_max_level_info",

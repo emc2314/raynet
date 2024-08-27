@@ -394,7 +394,7 @@ dependencies = [
 [[package]]
 name = "kcp"
 version = "0.6.0"
-source = "git+https://github.com/Matrix-Zhang/kcp.git#58e863fcbdf4cdd0df9e9c378a864dd4d0c8f58f"
+source = "git+https://github.com/emc2314/kcp.git#65ff07bb289d012b9c8a8e63775782b08d98e406"
 dependencies = [
  "bytes",
  "log",

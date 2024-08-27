@@ -92,14 +92,14 @@ pub struct KcpConfig {
 impl Default for KcpConfig {
     fn default() -> KcpConfig {
         KcpConfig {
-            mtu: 1160,
+            mtu: 1165,
             nodelay: KcpNoDelayConfig {
                 nodelay: true,
                 interval: 10,
                 resend: 2,
                 nc: true,
             },
-            wnd_size: (1024, 1024),
+            wnd_size: (1024, 1536),
             session_expire: Some(Duration::from_secs(30)),
             flush_write: true,
             flush_acks_input: true,
