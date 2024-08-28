@@ -8,31 +8,53 @@ use tokio::sync::mpsc::{error, Sender};
 
 use crate::utils::{now_millis, NonceFilter};
 
+#[derive(Debug, Clone, Copy)]
+pub enum RayPacketType {
+    DataPacket,
+    StatRequest,
+    StatResponse,
+}
+impl From<RayPacketType> for u8 {
+    fn from(value: RayPacketType) -> Self {
+        match value {
+            RayPacketType::DataPacket => 0,
+            RayPacketType::StatRequest => 1,
+            RayPacketType::StatResponse => 2,
+        }
+    }
+}
+impl TryFrom<u8> for RayPacketType {
+    type Error = ();
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(RayPacketType::DataPacket),
+            1 => Ok(RayPacketType::StatRequest),
+            2 => Ok(RayPacketType::StatResponse),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RayPacket {
-    flag: u8,
-    src: u8,
-    dst: u8,
+    pub ptype: RayPacketType,
     pub kcp: KCPPacket,
 }
 impl RayPacket {
-    pub fn new(flag: u8, src: u8, dst: u8, kcp: KCPPacket) -> Self {
+    const HEADER_SIZE: usize = 33;
+    pub fn new(ptype: RayPacketType, kcp: KCPPacket) -> Self {
         RayPacket {
-            flag,
-            src,
-            dst,
+            ptype,
             kcp,
         }
     }
     pub fn encrypt(&self, key: &Key, out: &mut [u8]) -> usize {
         let nonce: Nonce = rand::thread_rng().gen();
         let cipher = Aegis128L::new(key, &nonce);
-        let rsize = self.kcp.data.len() + 35;
+        let rsize = self.kcp.data.len() + Self::HEADER_SIZE;
         out[0..16].copy_from_slice(&nonce);
-        out[32] = self.flag;
-        out[33] = self.src;
-        out[34] = self.dst;
-        out[35..rsize].copy_from_slice(&self.kcp.data);
+        out[32] = self.ptype.into();
+        out[Self::HEADER_SIZE..rsize].copy_from_slice(&self.kcp.data);
         let ad = (now_millis() >> 15).to_le_bytes();
         let tag: Tag<16> = cipher.encrypt_in_place(&mut out[32..rsize], &ad);
         out[16..32].copy_from_slice(&tag);
@@ -43,7 +65,7 @@ impl RayPacket {
         data: &[u8],
         filter: Arc<NonceFilter>,
     ) -> Result<Self, RayPacketError> {
-        if data.len() < 35 || data.len() > 4096 {
+        if data.len() < Self::HEADER_SIZE || data.len() > 4096 {
             return Err(RayPacketError::BufLengthError);
         }
         let nonce = data[0..16].try_into().unwrap();
@@ -66,11 +88,9 @@ impl RayPacket {
                 cipher.decrypt(&data[32..], &tag, &adjusted_ad)
             })
             .map(|m| RayPacket {
-                flag: m[0],
-                src: m[1],
-                dst: m[2],
+                ptype: m[0].try_into().unwrap(),
                 kcp: KCPPacket {
-                    data: m[3..].to_vec(),
+                    data: m[1..].to_vec(),
                 },
             })
             .map_err(|e| RayPacketError::DecryptError(e))
