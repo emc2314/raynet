@@ -18,7 +18,8 @@ mod utils;
 use connections::Connections;
 use local::{endpoint_from, endpoint_to};
 use packets::{KCPPacket, RayPacket, TCPPacket};
-use remote::{endpoint_in, endpoint_out, forward_in, forward_out};
+use remote::{endpoint_in, endpoint_out, forward_in, forward_out, stat_request, stat_update};
+use routing::{Nodes, WeightInfo};
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -80,16 +81,18 @@ async fn main() -> io::Result<()> {
         .expect("Unable to resolve listen address")
         .next()
         .unwrap();
-    let send_addr: Vec<SocketAddr> = matches
-        .get_many::<String>("send")
-        .unwrap()
-        .map(|str| {
-            str.to_socket_addrs()
-                .expect("Unable to resolve send address")
-                .next()
-                .unwrap()
-        })
-        .collect::<Vec<SocketAddr>>();
+    let nodes = Arc::new(Nodes::new(
+        matches
+            .get_many::<String>("send")
+            .unwrap()
+            .map(|str| {
+                str.to_socket_addrs()
+                    .expect("Unable to resolve send address")
+                    .next()
+                    .unwrap()
+            })
+            .collect::<Vec<SocketAddr>>(),
+    ));
     let key = blake3::derive_key(
         "RayNet PSK v1",
         matches.get_one::<String>("key").unwrap().as_bytes(),
@@ -98,23 +101,38 @@ async fn main() -> io::Result<()> {
         .unwrap();
 
     let connections = Arc::new(RwLock::new(Connections::new()));
-    let udp_socket = UdpSocket::bind(listen_addr).await?;
+    let udp_socket = Arc::new(UdpSocket::bind(listen_addr).await?);
+
+    let (stat_tx, stat_rx) = mpsc::channel::<WeightInfo>(32);
+    {
+        let nodes = nodes.clone();
+        let udp_socket = udp_socket.clone();
+        tokio::spawn(async move {
+            stat_request(nodes, &key, udp_socket).await;
+        });
+    }
+    {
+        let nodes = nodes.clone();
+        tokio::spawn(async move {
+            stat_update(nodes, stat_rx).await;
+        });
+    }
 
     if !matches.get_flag("endpoint") {
         let (ray_tx, ray_rx) = mpsc::channel::<RayPacket>(65536);
         // Input thread
         tokio::spawn(async move {
-            forward_in(udp_socket, ray_tx, &key).await;
+            forward_in(udp_socket, ray_tx, &key, stat_tx).await;
         });
 
         // Output thread
         tokio::spawn(async move {
-            forward_out(ray_rx, send_addr, &key).await;
+            forward_out(ray_rx, nodes, &key).await;
         });
         info!("Started RayNet Forwarder");
     } else {
         let (kcp_tx, kcp_rx) = mpsc::channel::<KCPPacket>(65536);
-        let (tcp_tx, mut tcp_rx) = mpsc::channel::<TCPPacket>(65536);
+        let (tcp_tx, tcp_rx) = mpsc::channel::<TCPPacket>(65536);
 
         // UDP input thread
         {
@@ -122,7 +140,7 @@ async fn main() -> io::Result<()> {
             let kcp_tx = kcp_tx.clone();
             let tcp_tx = tcp_tx.clone();
             tokio::spawn(async move {
-                endpoint_in(udp_socket, kcp_tx, connections, tcp_tx, &key).await;
+                endpoint_in(udp_socket, kcp_tx, connections, tcp_tx, &key, stat_tx).await;
             });
         }
 
@@ -140,10 +158,10 @@ async fn main() -> io::Result<()> {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
                 tokio::spawn(async move {
-                    endpoint_to(connections, &mut tcp_rx).await;
+                    endpoint_to(connections, tcp_rx).await;
                 });
                 tokio::spawn(async move {
-                    endpoint_out(kcp_rx, send_addr, &key).await;
+                    endpoint_out(kcp_rx, nodes, &key).await;
                 });
                 let _ = tokio::signal::ctrl_c().await;
             });

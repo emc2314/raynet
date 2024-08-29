@@ -43,10 +43,7 @@ pub struct RayPacket {
 impl RayPacket {
     const HEADER_SIZE: usize = 33;
     pub fn new(ptype: RayPacketType, kcp: KCPPacket) -> Self {
-        RayPacket {
-            ptype,
-            kcp,
-        }
+        RayPacket { ptype, kcp }
     }
     pub fn encrypt(&self, key: &Key, out: &mut [u8]) -> usize {
         let nonce: Nonce = rand::thread_rng().gen();

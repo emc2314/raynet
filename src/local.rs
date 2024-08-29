@@ -75,7 +75,7 @@ pub async fn endpoint_from(
 
 pub async fn endpoint_to(
     connections: Arc<RwLock<Connections>>,
-    tcp_rx: &mut mpsc::Receiver<TCPPacket>,
+    mut tcp_rx: mpsc::Receiver<TCPPacket>,
 ) {
     while let Some(packet) = tcp_rx.recv().await {
         let addr = packet.addr;
