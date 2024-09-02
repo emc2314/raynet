@@ -83,15 +83,7 @@ async fn main() -> io::Result<()> {
     let nodes = Arc::new(Nodes::new(
         cli.send
             .or(file_config.send)
-            .unwrap_or_else(|| vec!["[::1]:8443".to_string()])
-            .into_iter()
-            .map(|s| {
-                s.to_socket_addrs()
-                    .expect("Unable to resolve send address")
-                    .next()
-                    .unwrap()
-            })
-            .collect(),
+            .unwrap_or_else(|| vec!["[::1]:8443".to_string()]),
     ));
     let key = blake3::derive_key(
         "RayNet PSK v1",

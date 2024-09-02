@@ -37,9 +37,15 @@ async fn udp_send(
 
 pub async fn stat_request(nodes: Arc<Nodes>, key: &Key, socket: Arc<UdpSocket>) {
     let mut buf = vec![0u8; 65535];
-    let factor = 0.8;
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
+        for node in nodes.nodes.iter() {
+            let weight = node.weight.load(Ordering::Relaxed);
+            node.weight.store(weight * 0.8, Ordering::Relaxed);
+            if node.weight.load(Ordering::Relaxed) < 0.1 {
+                warn!("Lost node: {:?}", node.name);
+            }
+        }
         for node in nodes.nodes.iter() {
             node.tc.inc();
             let packet = RayPacket::new(
@@ -49,8 +55,6 @@ pub async fn stat_request(nodes: Arc<Nodes>, key: &Key, socket: Arc<UdpSocket>) 
                 },
             );
             udp_send(socket.as_ref(), node.addr, packet, key, &mut buf).await;
-            let weight = node.weight.load(Ordering::Relaxed);
-            node.weight.store(weight * factor, Ordering::Relaxed);
         }
     }
 }
@@ -70,7 +74,7 @@ pub async fn stat_update(nodes: Arc<Nodes>, mut stat_rx: mpsc::Receiver<WeightIn
             if !flag {
                 error!("Received weight from unknown node {}", info.addr);
             }
-            debug!("NodeInfo: {:?}", nodes.nodes);
+            debug!("Nodes: {:?}", nodes.nodes);
         }
     }
 }

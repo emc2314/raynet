@@ -1,7 +1,7 @@
 use atomic_float::AtomicF32;
 use rand::distributions::{Distribution, WeightedIndex};
 use std::fmt::{self, Debug};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -72,6 +72,7 @@ impl TimedCounter {
 }
 
 pub struct NodeInfo {
+    pub name: String,
     pub addr: SocketAddr,
     pub tc: TimedCounter,
     pub weight: AtomicF32,
@@ -79,6 +80,7 @@ pub struct NodeInfo {
 impl Debug for NodeInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NodeInfo")
+            .field("name", &self.name)
             .field("addr", &self.addr)
             .field("tc", &self.tc.get())
             .field("weight", &self.weight.load(Ordering::Relaxed))
@@ -90,12 +92,17 @@ pub struct Nodes {
     pub nodes: Vec<NodeInfo>,
 }
 impl Nodes {
-    pub fn new(addrs: Vec<SocketAddr>) -> Nodes {
+    pub fn new(names: Vec<String>) -> Nodes {
         Nodes {
-            nodes: addrs
+            nodes: names
                 .into_iter()
-                .map(|addr| NodeInfo {
-                    addr,
+                .map(|name| NodeInfo {
+                    name: name.clone(),
+                    addr: name
+                        .to_socket_addrs()
+                        .expect("Unable to resolve send address")
+                        .next()
+                        .unwrap(),
                     tc: TimedCounter::new(),
                     weight: AtomicF32::new(1.0),
                 })
