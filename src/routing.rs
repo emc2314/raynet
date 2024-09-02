@@ -113,23 +113,18 @@ impl Nodes {
         let exps = self
             .nodes
             .iter()
-            .map(|x| (x.weight.load(Ordering::Relaxed)).exp());
+            .map(|x| (x.weight.load(Ordering::Relaxed) * 10.0).exp());
         let sum: f32 = exps.clone().sum();
         let dist = WeightedIndex::new(exps.map(|x| x / sum)).unwrap();
         dist.sample(rng)
     }
     pub fn route(&self, rng: &mut rand::rngs::ThreadRng) -> SocketAddr {
-        let mut index = 0;
-        if self.nodes.len() > 1 {
-            index = self.softmax(rng);
-        }
+        let index = if self.nodes.len() > 1 {
+            self.softmax(rng)
+        } else {
+            0
+        };
         self.nodes[index].tc.inc();
         self.nodes[index].addr
     }
-}
-
-#[derive(Debug)]
-pub struct WeightInfo {
-    pub addr: SocketAddr,
-    pub weight: f32,
 }

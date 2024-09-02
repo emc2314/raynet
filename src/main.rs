@@ -20,8 +20,8 @@ mod utils;
 use connections::Connections;
 use local::{endpoint_from, endpoint_to};
 use packets::{KCPPacket, RayPacket, TCPPacket};
-use remote::{endpoint_in, endpoint_out, forward_in, forward_out, stat_request, stat_update};
-use routing::{Nodes, WeightInfo};
+use remote::{endpoint_in, endpoint_out, forward_in, forward_out, stat_request};
+use routing::Nodes;
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -98,7 +98,6 @@ async fn main() -> io::Result<()> {
     let connections = Arc::new(RwLock::new(Connections::new()));
     let udp_socket = Arc::new(UdpSocket::bind(listen_addr).await?);
 
-    let (stat_tx, stat_rx) = mpsc::channel::<WeightInfo>(32);
     {
         let nodes = nodes.clone();
         let udp_socket = udp_socket.clone();
@@ -106,19 +105,16 @@ async fn main() -> io::Result<()> {
             stat_request(nodes, &key, udp_socket).await;
         });
     }
-    {
-        let nodes = nodes.clone();
-        tokio::spawn(async move {
-            stat_update(nodes, stat_rx).await;
-        });
-    }
 
     if !endpoint {
         let (ray_tx, ray_rx) = mpsc::channel::<RayPacket>(65536);
         // Input thread
-        tokio::spawn(async move {
-            forward_in(udp_socket, ray_tx, &key, stat_tx).await;
-        });
+        {
+            let nodes = nodes.clone();
+            tokio::spawn(async move {
+                forward_in(udp_socket, ray_tx, &key, nodes).await;
+            });
+        }
 
         // Output thread
         tokio::spawn(async move {
@@ -134,8 +130,9 @@ async fn main() -> io::Result<()> {
             let connections = connections.clone();
             let kcp_tx = kcp_tx.clone();
             let tcp_tx = tcp_tx.clone();
+            let nodes = nodes.clone();
             tokio::spawn(async move {
-                endpoint_in(udp_socket, kcp_tx, connections, tcp_tx, &key, stat_tx).await;
+                endpoint_in(udp_socket, kcp_tx, connections, tcp_tx, &key, nodes).await;
             });
         }
 

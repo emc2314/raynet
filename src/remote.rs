@@ -2,10 +2,11 @@ use aegis::aegis128l::Key;
 use futures::future::join_all;
 use log::{debug, error, warn};
 use rand::seq::IteratorRandom;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, RwLock};
@@ -13,7 +14,7 @@ use tokio::time::Duration;
 
 use crate::connections::Connections;
 use crate::packets::{KCPPacket, RayPacket, RayPacketError, RayPacketType, TCPPacket};
-use crate::routing::{Nodes, TimedCounter, WeightInfo};
+use crate::routing::{Nodes, TimedCounter};
 use crate::utils::NonceFilter;
 
 async fn udp_send(
@@ -40,9 +41,9 @@ pub async fn stat_request(nodes: Arc<Nodes>, key: &Key, socket: Arc<UdpSocket>) 
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
         for node in nodes.nodes.iter() {
-            let weight = node.weight.load(Ordering::Relaxed);
-            node.weight.store(weight * 0.8, Ordering::Relaxed);
-            if node.weight.load(Ordering::Relaxed) < 0.1 {
+            let weight = node.weight.load(Relaxed);
+            node.weight.store(weight * 0.8, Relaxed);
+            if node.weight.load(Relaxed) < 0.01 {
                 warn!("Lost node: {:?}", node.name);
             }
         }
@@ -59,30 +60,27 @@ pub async fn stat_request(nodes: Arc<Nodes>, key: &Key, socket: Arc<UdpSocket>) 
     }
 }
 
-pub async fn stat_update(nodes: Arc<Nodes>, mut stat_rx: mpsc::Receiver<WeightInfo>) {
-    loop {
-        if let Some(info) = stat_rx.recv().await {
-            let mut flag = false;
-            let ip = info.addr.ip().to_canonical();
-            for node in nodes.nodes.iter() {
-                if node.addr.ip() == ip {
-                    node.weight.store(info.weight, Ordering::Relaxed);
-                    flag = true;
-                    break;
-                }
-            }
-            if !flag {
-                error!("Received weight from unknown node {}", info.addr);
-            }
-            debug!("Nodes: {:?}", nodes.nodes);
+fn stat_update(nodes: Arc<Nodes>, addr: SocketAddr, weight: f32) {
+    let mut flag = false;
+    let ip = addr.ip().to_canonical();
+    for node in nodes.nodes.iter() {
+        if node.addr.ip() == ip {
+            node.weight.store(weight, Relaxed);
+            flag = true;
+            break;
         }
     }
+    if !flag {
+        error!("Received weight from unknown node {}", addr);
+    }
+    debug!("Nodes: {:?}", nodes.nodes);
 }
 
 async fn udp_in<F, Fut>(
     udp_socket: Arc<UdpSocket>,
     key: &Key,
-    stat_tx: mpsc::Sender<WeightInfo>,
+    nodes: Arc<Nodes>,
+    endpoint: bool,
     mut process_packet: F,
 ) where
     F: FnMut(RayPacket) -> Fut,
@@ -105,10 +103,27 @@ async fn udp_in<F, Fut>(
                         RayPacketType::StatRequest => {
                             let tc = imap.entry(src.ip()).or_insert_with(TimedCounter::new);
                             tc.inc();
+                            let max_next = if endpoint {
+                                1.0
+                            } else {
+                                nodes
+                                    .nodes
+                                    .iter()
+                                    .map(|node| node.weight.load(Relaxed))
+                                    .max_by(|a, b| {
+                                        a.partial_cmp(b).unwrap_or(match (a.is_nan(), b.is_nan()) {
+                                            (true, true) => Ordering::Equal,
+                                            (true, false) => Ordering::Less,
+                                            (false, true) => Ordering::Greater,
+                                            (false, false) => Ordering::Equal,
+                                        })
+                                    })
+                                    .unwrap_or(1.0)
+                            };
                             let weight = (tc.get() as f32
                                 / (f32::from_le_bytes(packet.kcp.data[0..4].try_into().unwrap())
                                     + 10.0))
-                                * 10.0;
+                                * max_next;
                             let packet = RayPacket::new(
                                 RayPacketType::StatResponse,
                                 KCPPacket {
@@ -120,9 +135,7 @@ async fn udp_in<F, Fut>(
                         RayPacketType::StatResponse => {
                             let weight =
                                 f32::from_le_bytes(packet.kcp.data[0..4].try_into().unwrap());
-                            if let Err(e) = stat_tx.send(WeightInfo { addr: src, weight }).await {
-                                error!("Failed to send to channel: {}", e);
-                            }
+                            stat_update(nodes.clone(), src, weight);
                         }
                     },
                     Err(RayPacketError::NonceReuseError) => {
@@ -142,7 +155,7 @@ pub async fn forward_in(
     udp_socket: Arc<UdpSocket>,
     ray_tx: mpsc::Sender<RayPacket>,
     key: &Key,
-    stat_tx: mpsc::Sender<WeightInfo>,
+    nodes: Arc<Nodes>,
 ) {
     let process_forward = |packet: RayPacket| async {
         if let Err(e) = ray_tx.send(packet).await {
@@ -150,7 +163,7 @@ pub async fn forward_in(
         }
     };
 
-    udp_in(udp_socket, key, stat_tx, process_forward).await;
+    udp_in(udp_socket, key, nodes, false, process_forward).await;
 }
 
 pub async fn endpoint_in(
@@ -159,7 +172,7 @@ pub async fn endpoint_in(
     connections: Arc<RwLock<Connections>>,
     tcp_tx: mpsc::Sender<TCPPacket>,
     key: &Key,
-    stat_tx: mpsc::Sender<WeightInfo>,
+    nodes: Arc<Nodes>,
 ) {
     let process_endpoint = |packet: RayPacket| async {
         let packet = packet.kcp;
@@ -188,7 +201,7 @@ pub async fn endpoint_in(
         }
     };
 
-    udp_in(udp_socket, key, stat_tx, process_endpoint).await;
+    udp_in(udp_socket, key, nodes, true, process_endpoint).await;
 }
 
 async fn udp_out<T, F>(mut rx: mpsc::Receiver<T>, nodes: Arc<Nodes>, key: &Key, process_packet: F)
