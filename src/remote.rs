@@ -37,6 +37,7 @@ async fn udp_send(
 
 pub async fn stat_request(nodes: Arc<Nodes>, key: &Key, socket: Arc<UdpSocket>) {
     let mut buf = vec![0u8; 65535];
+    let factor = 0.8;
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
         for node in nodes.nodes.iter() {
@@ -48,12 +49,13 @@ pub async fn stat_request(nodes: Arc<Nodes>, key: &Key, socket: Arc<UdpSocket>) 
                 },
             );
             udp_send(socket.as_ref(), node.addr, packet, key, &mut buf).await;
+            let weight = node.weight.load(Ordering::Relaxed);
+            node.weight.store(weight * factor, Ordering::Relaxed);
         }
     }
 }
 
 pub async fn stat_update(nodes: Arc<Nodes>, mut stat_rx: mpsc::Receiver<WeightInfo>) {
-    let factor = 0.8_f32.powf(1.0 / nodes.nodes.len() as f32);
     loop {
         if let Some(info) = stat_rx.recv().await {
             let mut flag = false;
@@ -62,9 +64,7 @@ pub async fn stat_update(nodes: Arc<Nodes>, mut stat_rx: mpsc::Receiver<WeightIn
                 if node.addr.ip() == ip {
                     node.weight.store(info.weight, Ordering::Relaxed);
                     flag = true;
-                } else {
-                    let weight = node.weight.load(Ordering::Relaxed);
-                    node.weight.store(weight * factor, Ordering::Relaxed);
+                    break;
                 }
             }
             if !flag {
@@ -102,7 +102,8 @@ async fn udp_in<F, Fut>(
                             let tc = imap.entry(src.ip()).or_insert_with(TimedCounter::new);
                             tc.inc();
                             let weight = (tc.get() as f32
-                                / f32::from_le_bytes(packet.kcp.data[0..4].try_into().unwrap()))
+                                / (f32::from_le_bytes(packet.kcp.data[0..4].try_into().unwrap())
+                                    + 10.0))
                                 * 10.0;
                             let packet = RayPacket::new(
                                 RayPacketType::StatResponse,

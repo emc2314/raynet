@@ -99,7 +99,7 @@ impl Default for KcpConfig {
                 resend: 2,
                 nc: true,
             },
-            wnd_size: (1024, 1536),
+            wnd_size: (2048, 2048),
             session_expire: Some(Duration::from_secs(30)),
             flush_write: true,
             flush_acks_input: true,
