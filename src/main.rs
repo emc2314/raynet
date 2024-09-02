@@ -1,9 +1,11 @@
-use clap::{Arg, Command};
+use clap::Parser;
 use env_logger::Env;
 use log::{debug, info};
-use std::io;
+use serde::Deserialize;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::Path;
 use std::sync::Arc;
+use std::{fs, io};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, RwLock};
 
@@ -27,6 +29,31 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+#[derive(Deserialize, Default)]
+struct FileConfig {
+    endpoint: Option<bool>,
+    listen: Option<String>,
+    send: Option<Vec<String>>,
+    key: Option<String>,
+}
+
+#[derive(Parser)]
+#[command(name = "RayNet")]
+#[command(version = "0.1.0")]
+#[command(about = "Cross the fire")]
+struct CliConfig {
+    #[arg(short, long)]
+    endpoint: bool,
+    #[arg(short, long, value_name = "ADDRESS")]
+    listen: Option<String>,
+    #[arg(short, long, value_name = "ADDRESS", num_args = 1.., value_delimiter = ',')]
+    send: Option<Vec<String>>,
+    #[arg(short, long)]
+    key: Option<String>,
+    #[arg(short, long, value_name = "CONFIG_FILE")]
+    config: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let env = Env::default()
@@ -34,68 +61,44 @@ async fn main() -> io::Result<()> {
         .write_style_or("RAYNET_LOG_STYLE", "always");
     env_logger::init_from_env(env);
 
-    let matches = Command::new("RayNet")
-        .version("0.1.0")
-        .about("Cross the fire")
-        .arg(
-            Arg::new("listen")
-                .short('l')
-                .long("listen")
-                .value_name("ADDRESS")
-                .help("Sets the address to listen on")
-                .num_args(1)
-                .default_value("[::0]:8443"),
-        )
-        .arg(
-            Arg::new("send")
-                .short('s')
-                .long("send")
-                .value_name("ADDRESS")
-                .help("Sets the address to send to")
-                .num_args(1..)
-                .default_value("[::1]:8443")
-                .use_value_delimiter(true)
-                .value_delimiter(','),
-        )
-        .arg(
-            Arg::new("endpoint")
-                .short('e')
-                .long("endpoint")
-                .help("Indicate endpoint")
-                .num_args(0),
-        )
-        .arg(
-            Arg::new("key")
-                .short('k')
-                .long("key")
-                .help("Pre shared key")
-                .num_args(1)
-                .default_value("19260817"),
-        )
-        .get_matches();
+    let cli = CliConfig::parse();
+    let file_config = match cli.config.as_ref() {
+        Some(path) => {
+            let config_str =
+                fs::read_to_string(Path::new(path)).expect("Failed to read config file");
+            toml::from_str(&config_str).expect("Failed to parse config file")
+        }
+        None => FileConfig::default(),
+    };
 
-    let listen_addr: SocketAddr = matches
-        .get_one::<String>("listen")
-        .unwrap()
+    let endpoint = cli.endpoint || file_config.endpoint.unwrap_or(false);
+    let listen_addr: SocketAddr = cli
+        .listen
+        .or(file_config.listen)
+        .unwrap_or_else(|| "[::0]:8443".to_string())
         .to_socket_addrs()
         .expect("Unable to resolve listen address")
         .next()
         .unwrap();
     let nodes = Arc::new(Nodes::new(
-        matches
-            .get_many::<String>("send")
-            .unwrap()
-            .map(|str| {
-                str.to_socket_addrs()
+        cli.send
+            .or(file_config.send)
+            .unwrap_or_else(|| vec!["[::1]:8443".to_string()])
+            .into_iter()
+            .map(|s| {
+                s.to_socket_addrs()
                     .expect("Unable to resolve send address")
                     .next()
                     .unwrap()
             })
-            .collect::<Vec<SocketAddr>>(),
+            .collect(),
     ));
     let key = blake3::derive_key(
         "RayNet PSK v1",
-        matches.get_one::<String>("key").unwrap().as_bytes(),
+        cli.key
+            .or(file_config.key)
+            .unwrap_or_else(|| "19260817".to_string())
+            .as_bytes(),
     )[..16]
         .try_into()
         .unwrap();
@@ -118,7 +121,7 @@ async fn main() -> io::Result<()> {
         });
     }
 
-    if !matches.get_flag("endpoint") {
+    if !endpoint {
         let (ray_tx, ray_rx) = mpsc::channel::<RayPacket>(65536);
         // Input thread
         tokio::spawn(async move {

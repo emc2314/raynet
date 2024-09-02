@@ -1,7 +1,6 @@
 use core::fmt;
 use fastbloom::BloomFilter;
 use std::hash::Hash;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -104,67 +103,5 @@ impl NonceFilter {
 
         self.filter.write().await.0.insert(nonce);
         true
-    }
-}
-
-const BUCKET_NUM: usize = 64;
-#[derive(Debug)]
-pub struct TimedCounter {
-    buffer: [AtomicU32; BUCKET_NUM],
-    last_update: AtomicU64,
-}
-
-impl TimedCounter {
-    const WINDOW_NANOS: u64 = 4294967296;
-    const BUCKET_LENGTH: u64 = Self::WINDOW_NANOS / BUCKET_NUM as u64;
-
-    pub fn new() -> Self {
-        TimedCounter {
-            buffer: [(); BUCKET_NUM].map(|_| AtomicU32::new(0)),
-            last_update: AtomicU64::new(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as u64,
-            ),
-        }
-    }
-
-    pub fn inc(&self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        let last_update = self.last_update.load(Ordering::Relaxed);
-        let current_index = ((now / Self::BUCKET_LENGTH) % BUCKET_NUM as u64) as usize;
-
-        for i in 0..BUCKET_NUM {
-            let index = (current_index + BUCKET_NUM - i) % BUCKET_NUM;
-            if now - (now % Self::BUCKET_LENGTH) <= last_update + i as u64 * Self::BUCKET_LENGTH {
-                break;
-            }
-            self.buffer[index].store(0, Ordering::Relaxed);
-        }
-        self.buffer[current_index].fetch_add(1, Ordering::Relaxed);
-        self.last_update.store(now, Ordering::Relaxed);
-    }
-
-    pub fn get(&self) -> u32 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        let current_index = ((now / Self::BUCKET_LENGTH) % BUCKET_NUM as u64) as usize;
-        let last_update = self.last_update.load(Ordering::Relaxed);
-        let mut total = 0;
-
-        for i in 0..BUCKET_NUM {
-            if now - (now % Self::BUCKET_LENGTH) <= last_update + i as u64 * Self::BUCKET_LENGTH {
-                let index = (current_index + BUCKET_NUM - i) % BUCKET_NUM;
-                total += self.buffer[index].load(Ordering::Relaxed);
-            }
-        }
-
-        total
     }
 }

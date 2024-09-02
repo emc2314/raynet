@@ -5,6 +5,7 @@ use rand::seq::IteratorRandom;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, RwLock};
@@ -12,8 +13,8 @@ use tokio::time::Duration;
 
 use crate::connections::Connections;
 use crate::packets::{KCPPacket, RayPacket, RayPacketError, RayPacketType, TCPPacket};
-use crate::routing::{Nodes, WeightInfo};
-use crate::utils::{NonceFilter, TimedCounter};
+use crate::routing::{Nodes, TimedCounter, WeightInfo};
+use crate::utils::NonceFilter;
 
 async fn udp_send(
     socket: &UdpSocket,
@@ -30,7 +31,7 @@ async fn udp_send(
                 error!("Sent partial {} of {} bytes", sent_size, rsize);
             }
         }
-        Err(e) => error!("Failed to send to UDP: {}", e),
+        Err(e) => error!("UDP Failed to send to {}: {}", remote, e),
     }
 }
 
@@ -52,29 +53,24 @@ pub async fn stat_request(nodes: Arc<Nodes>, key: &Key, socket: Arc<UdpSocket>) 
 }
 
 pub async fn stat_update(nodes: Arc<Nodes>, mut stat_rx: mpsc::Receiver<WeightInfo>) {
+    let factor = 0.8_f32.powf(1.0 / nodes.nodes.len() as f32);
     loop {
         if let Some(info) = stat_rx.recv().await {
             let mut flag = false;
+            let ip = info.addr.ip().to_canonical();
             for node in nodes.nodes.iter() {
-                if node.addr == info.addr {
-                    node.weight
-                        .store(info.weight, std::sync::atomic::Ordering::Relaxed);
+                if node.addr.ip() == ip {
+                    node.weight.store(info.weight, Ordering::Relaxed);
                     flag = true;
                 } else {
-                    let weight = node.weight.load(std::sync::atomic::Ordering::Relaxed);
-                    node.weight
-                        .store(weight * 0.8, std::sync::atomic::Ordering::Relaxed);
+                    let weight = node.weight.load(Ordering::Relaxed);
+                    node.weight.store(weight * factor, Ordering::Relaxed);
                 }
-                debug!(
-                    "node {} tc {} weight {}",
-                    node.addr,
-                    node.tc.get(),
-                    node.weight.load(std::sync::atomic::Ordering::Relaxed)
-                );
             }
             if !flag {
                 error!("Received weight from unknown node {}", info.addr);
             }
+            debug!("NodeInfo: {:?}", nodes.nodes);
         }
     }
 }

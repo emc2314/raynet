@@ -139,7 +139,7 @@ pub struct KcpSocket {
 
 impl Debug for KcpSocket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("KcpSession")
+        f.debug_struct("KcpSocket")
             .field("kcp.conv", &self.kcp.conv())
             .field("kcp.dead", &self.kcp.is_dead_link())
             .field("last_update", &self.last_update)

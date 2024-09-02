@@ -8,7 +8,7 @@ aegis = "0.6.6"
 atomic_float = "1.0.0"
 blake3 = "1.5.4"
 byte_string = "1.0.0"
-clap = "4.5.16"
+clap = { version = "4.5.16", features = ["derive"] }
 env_logger = "0.11.5"
 fastbloom = "0.7.1"
 futures = "0.3.30"
@@ -19,8 +19,10 @@ log = { version = "0.4", features = [
     "release_max_level_info",
 ] }
 rand = "0.8.5"
+serde = { version = "1.0.209", features = ["derive"] }
 spin = "0.9.8"
 tokio = { version = "1", features = ["full"] }
+toml = "0.8.19"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
