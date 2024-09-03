@@ -50,11 +50,11 @@ impl Connections {
                     KcpSocket::new(&config, conv, KcpOutput::new(kcp_tx.clone()), true).unwrap();
                 let session = KcpSession::new_shared(
                     kcp,
-                    KcpRecv::new(tcp_tx.clone(), addr.clone()),
+                    KcpRecv::new(tcp_tx.clone(), *addr),
                     config.session_expire,
                     false,
                 );
-                self.convs.insert(addr.clone(), conv).unwrap_none();
+                self.convs.insert(*addr, conv).unwrap_none();
                 self.kcps.insert(conv, session.clone()).unwrap_none();
                 info!("Assign TCP {} as {}", addr, conv);
                 Some(session)
@@ -72,11 +72,11 @@ impl Connections {
         let kcp = KcpSocket::new(&config, conv, KcpOutput::new(kcp_tx.clone()), true).unwrap();
         let session = KcpSession::new_shared(
             kcp,
-            KcpRecv::new(tcp_tx.clone(), addr.clone()),
+            KcpRecv::new(tcp_tx.clone(), *addr),
             config.session_expire,
             false,
         );
-        self.convs.insert(addr.clone(), conv).unwrap_none();
+        self.convs.insert(*addr, conv).unwrap_none();
         self.kcps.insert(conv, session.clone()).unwrap_none();
         info!("Assign TCP {} as {}", addr, conv);
         session

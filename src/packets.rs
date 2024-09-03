@@ -70,7 +70,7 @@ impl RayPacket {
             return Err(RayPacketError::NonceReuseError);
         }
         let tag: Tag<16> = data[16..32].try_into().unwrap();
-        let cipher = Aegis128L::new(key, &nonce);
+        let cipher = Aegis128L::new(key, nonce);
         let ts = now_millis();
         let ad = (ts >> 15).to_le_bytes();
         cipher
@@ -90,7 +90,7 @@ impl RayPacket {
                     data: m[1..].to_vec(),
                 },
             })
-            .map_err(|e| RayPacketError::DecryptError(e))
+            .map_err(RayPacketError::DecryptError)
     }
 }
 

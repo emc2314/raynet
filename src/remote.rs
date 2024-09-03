@@ -94,7 +94,7 @@ async fn udp_in<F, Fut>(
         match udp_socket.recv_from(&mut buf).await {
             Ok((size, src)) => {
                 debug!("Received {} bytes from {}", size, src);
-                match RayPacket::decrypt(key, &mut buf[..size], filter.clone()).await {
+                match RayPacket::decrypt(key, &buf[..size], filter.clone()).await {
                     Ok(packet) => match packet.ptype {
                         RayPacketType::DataPacket => {
                             imap.entry(src.ip()).or_insert_with(TimedCounter::new).inc();
@@ -111,11 +111,13 @@ async fn udp_in<F, Fut>(
                                     .iter()
                                     .map(|node| node.weight.load(Relaxed))
                                     .max_by(|a, b| {
-                                        a.partial_cmp(b).unwrap_or(match (a.is_nan(), b.is_nan()) {
-                                            (true, true) => Ordering::Equal,
-                                            (true, false) => Ordering::Less,
-                                            (false, true) => Ordering::Greater,
-                                            (false, false) => Ordering::Equal,
+                                        a.partial_cmp(b).unwrap_or_else(|| {
+                                            match (a.is_nan(), b.is_nan()) {
+                                                (true, true) => Ordering::Equal,
+                                                (true, false) => Ordering::Less,
+                                                (false, true) => Ordering::Greater,
+                                                (false, false) => Ordering::Equal,
+                                            }
                                         })
                                     })
                                     .unwrap_or(1.0)
@@ -191,7 +193,7 @@ pub async fn endpoint_in(
             }
         };
         if let Some(session) = session {
-            if let Err(_) = session.input(&packet.data).await {
+            if session.input(&packet.data).await.is_err() {
                 error!("KCP session {} closed when input", conv);
                 session.close();
                 connections.write().await.close(&session.kcp_recv().addr);
@@ -225,7 +227,7 @@ where
             .choose(&mut rand::thread_rng())
             .unwrap();
         udp_send(
-            &udp_socket_out,
+            udp_socket_out,
             remote,
             process_packet(packet),
             key,

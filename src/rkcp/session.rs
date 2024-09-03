@@ -216,7 +216,7 @@ impl KcpSession {
                         }
                     };
 
-                    if let Err(_) = session.recv(&mut recv_buffer, &mut recv_buffer_size).await {
+                    if session.recv(&mut recv_buffer, &mut recv_buffer_size).await.is_err() {
                         error!(
                             "[SESSION] Recv thread send data failed for session {}",
                             session.conv()
