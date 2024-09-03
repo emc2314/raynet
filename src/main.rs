@@ -23,11 +23,9 @@ use packets::{KCPPacket, RayPacket, TCPPacket};
 use remote::{endpoint_in, endpoint_out, forward_in, forward_out, stat_request};
 use routing::Nodes;
 
-#[cfg(not(target_env = "msvc"))]
-use tikv_jemallocator::Jemalloc;
-#[cfg(not(target_env = "msvc"))]
+use mimalloc::MiMalloc;
 #[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Deserialize, Default)]
 struct FileConfig {

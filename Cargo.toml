@@ -23,6 +23,13 @@ serde = { version = "1.0.209", features = ["derive"] }
 spin = "0.9.8"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8.19"
+mimalloc = "0.1.43"
 
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.6"
+[profile.release]
+codegen-units = 1
+lto = "fat"
+strip = "symbols"
+panic = "abort"
+
+[build]
+rustflags = ["-C", "target-cpu=native"]

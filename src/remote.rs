@@ -44,7 +44,7 @@ pub async fn stat_request(nodes: Arc<Nodes>, key: &Key, socket: Arc<UdpSocket>) 
             let weight = node.weight.load(Relaxed);
             node.weight.store(weight * 0.8, Relaxed);
             if node.weight.load(Relaxed) < 0.01 {
-                warn!("Lost node: {:?}", node.name);
+                warn!("Lost route: {:?}", node.name);
             }
         }
         for node in nodes.nodes.iter() {
