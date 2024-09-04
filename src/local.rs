@@ -6,11 +6,11 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::time::{sleep, Duration};
 
 use crate::connections::Connections;
-use crate::packets::{KCPPacket, TCPPacket};
+use crate::packets::{DataPacket, TCPPacket};
 
 pub async fn endpoint_from(
     tcp_listener: TcpListener,
-    kcp_tx: mpsc::Sender<KCPPacket>,
+    kcp_tx: mpsc::Sender<DataPacket>,
     connections: Arc<RwLock<Connections>>,
     tcp_tx: mpsc::Sender<TCPPacket>,
 ) {

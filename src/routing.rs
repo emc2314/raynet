@@ -1,4 +1,5 @@
 use atomic_float::AtomicF32;
+use bitcode::{Decode, Encode};
 use rand::distributions::{Distribution, WeightedIndex};
 use std::fmt::{self, Debug};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -127,4 +128,15 @@ impl Nodes {
         self.nodes[index].tc.inc();
         self.nodes[index].addr
     }
+}
+
+#[derive(Encode, Decode, Debug)]
+pub struct StatRequest {
+    pub index: u32,
+    pub tc: f32,
+}
+#[derive(Encode, Decode, Debug)]
+pub struct StatResponse {
+    pub index: u32,
+    pub weight: f32,
 }

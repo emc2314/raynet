@@ -13,14 +13,14 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::time::Duration;
 
 use crate::connections::Connections;
-use crate::packets::{KCPPacket, RayPacket, RayPacketError, RayPacketType, TCPPacket};
-use crate::routing::{Nodes, TimedCounter};
+use crate::packets::{DataPacket, RayPacket, RayPacketError, RayPacketType, TCPPacket};
+use crate::routing::{Nodes, StatRequest, StatResponse, TimedCounter};
 use crate::utils::NonceFilter;
 
 async fn udp_send(
     socket: &UdpSocket,
     remote: SocketAddr,
-    packet: RayPacket,
+    packet: &RayPacket,
     key: &Key,
     buf: &mut [u8],
 ) {
@@ -38,8 +38,10 @@ async fn udp_send(
 
 pub async fn stat_request(nodes: Arc<Nodes>, key: &Key, socket: Arc<UdpSocket>) {
     let mut buf = vec![0u8; 65535];
+    let mut index = 0;
     loop {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        debug!("Nodes: {:?}", nodes.nodes);
         for node in nodes.nodes.iter() {
             let weight = node.weight.load(Relaxed);
             node.weight.store(weight * 0.8, Relaxed);
@@ -51,16 +53,52 @@ pub async fn stat_request(nodes: Arc<Nodes>, key: &Key, socket: Arc<UdpSocket>) 
             node.tc.inc();
             let packet = RayPacket::new(
                 RayPacketType::StatRequest,
-                KCPPacket {
-                    data: (node.tc.get() as f32).to_le_bytes().to_vec(),
+                DataPacket {
+                    data: bitcode::encode(&StatRequest {
+                        index,
+                        tc: node.tc.get() as f32,
+                    }),
                 },
             );
-            udp_send(socket.as_ref(), node.addr, packet, key, &mut buf).await;
+            udp_send(socket.as_ref(), node.addr, &packet, key, &mut buf).await;
         }
+        index += 1;
     }
 }
 
-fn stat_update(nodes: Arc<Nodes>, addr: SocketAddr, weight: f32) {
+fn stat_respond(endpoint: bool, nodes: &Nodes, tc: f32, data: &[u8]) -> RayPacket {
+    let max_next = if endpoint {
+        1.0
+    } else {
+        nodes
+            .nodes
+            .iter()
+            .map(|node| node.weight.load(Relaxed))
+            .max_by(|a, b| {
+                a.partial_cmp(b)
+                    .unwrap_or_else(|| match (a.is_nan(), b.is_nan()) {
+                        (true, true) => Ordering::Equal,
+                        (true, false) => Ordering::Less,
+                        (false, true) => Ordering::Greater,
+                        (false, false) => Ordering::Equal,
+                    })
+            })
+            .unwrap_or(1.0)
+    };
+    let request: StatRequest = bitcode::decode(data).unwrap();
+    let weight = (tc / (request.tc + 2.0)) * max_next;
+    RayPacket::new(
+        RayPacketType::StatResponse,
+        DataPacket {
+            data: bitcode::encode(&StatResponse {
+                index: request.index,
+                weight,
+            }),
+        },
+    )
+}
+
+fn stat_update(nodes: &Nodes, addr: SocketAddr, weight: f32) {
     let mut flag = false;
     let ip = addr.ip().to_canonical();
     for node in nodes.nodes.iter() {
@@ -73,7 +111,6 @@ fn stat_update(nodes: Arc<Nodes>, addr: SocketAddr, weight: f32) {
     if !flag {
         error!("Received weight from unknown node {}", addr);
     }
-    debug!("Nodes: {:?}", nodes.nodes);
 }
 
 async fn udp_in<F, Fut>(
@@ -89,12 +126,13 @@ async fn udp_in<F, Fut>(
     let mut buf = vec![0u8; 65535];
     let filter = NonceFilter::new(1 << 24, 0.00001, Duration::from_millis(1 << 16));
     let mut imap = HashMap::<IpAddr, TimedCounter>::new();
+    let mut curr_index = 0;
 
     loop {
         match udp_socket.recv_from(&mut buf).await {
             Ok((size, src)) => {
                 debug!("Received {} bytes from {}", size, src);
-                match RayPacket::decrypt(key, &buf[..size], filter.clone()).await {
+                match RayPacket::decrypt(key, &buf[..size], filter.as_ref()).await {
                     Ok(packet) => match packet.ptype {
                         RayPacketType::DataPacket => {
                             imap.entry(src.ip()).or_insert_with(TimedCounter::new).inc();
@@ -103,41 +141,21 @@ async fn udp_in<F, Fut>(
                         RayPacketType::StatRequest => {
                             let tc = imap.entry(src.ip()).or_insert_with(TimedCounter::new);
                             tc.inc();
-                            let max_next = if endpoint {
-                                1.0
-                            } else {
-                                nodes
-                                    .nodes
-                                    .iter()
-                                    .map(|node| node.weight.load(Relaxed))
-                                    .max_by(|a, b| {
-                                        a.partial_cmp(b).unwrap_or_else(|| {
-                                            match (a.is_nan(), b.is_nan()) {
-                                                (true, true) => Ordering::Equal,
-                                                (true, false) => Ordering::Less,
-                                                (false, true) => Ordering::Greater,
-                                                (false, false) => Ordering::Equal,
-                                            }
-                                        })
-                                    })
-                                    .unwrap_or(1.0)
-                            };
-                            let weight = (tc.get() as f32
-                                / (f32::from_le_bytes(packet.kcp.data[0..4].try_into().unwrap())
-                                    + 10.0))
-                                * max_next;
-                            let packet = RayPacket::new(
-                                RayPacketType::StatResponse,
-                                KCPPacket {
-                                    data: weight.to_le_bytes().to_vec(),
-                                },
+                            let response = &stat_respond(
+                                endpoint,
+                                nodes.as_ref(),
+                                tc.get() as f32,
+                                &packet.data.data,
                             );
-                            udp_send(&udp_socket, src, packet, key, &mut buf).await;
+                            udp_send(&udp_socket, src, response, key, &mut buf).await;
                         }
                         RayPacketType::StatResponse => {
-                            let weight =
-                                f32::from_le_bytes(packet.kcp.data[0..4].try_into().unwrap());
-                            stat_update(nodes.clone(), src, weight);
+                            let response: StatResponse =
+                                bitcode::decode(&packet.data.data).unwrap();
+                            if response.index >= curr_index {
+                                stat_update(nodes.as_ref(), src, response.weight);
+                                curr_index = response.index;
+                            }
                         }
                     },
                     Err(RayPacketError::NonceReuseError) => {
@@ -170,14 +188,14 @@ pub async fn forward_in(
 
 pub async fn endpoint_in(
     udp_socket: Arc<UdpSocket>,
-    kcp_tx: mpsc::Sender<KCPPacket>,
+    kcp_tx: mpsc::Sender<DataPacket>,
     connections: Arc<RwLock<Connections>>,
     tcp_tx: mpsc::Sender<TCPPacket>,
     key: &Key,
     nodes: Arc<Nodes>,
 ) {
     let process_endpoint = |packet: RayPacket| async {
-        let packet = packet.kcp;
+        let packet = packet.data;
         let conv = kcp::get_conv(&packet.data);
         let session = {
             let con = connections.read().await;
@@ -229,7 +247,7 @@ where
         udp_send(
             udp_socket_out,
             remote,
-            process_packet(packet),
+            &process_packet(packet),
             key,
             &mut buf,
         )
@@ -241,7 +259,7 @@ pub async fn forward_out(ray_rx: mpsc::Receiver<RayPacket>, nodes: Arc<Nodes>, k
     udp_out(ray_rx, nodes, key, |packet| packet).await
 }
 
-pub async fn endpoint_out(kcp_rx: mpsc::Receiver<KCPPacket>, nodes: Arc<Nodes>, key: &Key) {
+pub async fn endpoint_out(kcp_rx: mpsc::Receiver<DataPacket>, nodes: Arc<Nodes>, key: &Key) {
     udp_out(kcp_rx, nodes, key, |packet| {
         RayPacket::new(RayPacketType::DataPacket, packet)
     })

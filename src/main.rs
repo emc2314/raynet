@@ -19,7 +19,7 @@ mod utils;
 
 use connections::Connections;
 use local::{endpoint_from, endpoint_to};
-use packets::{KCPPacket, RayPacket, TCPPacket};
+use packets::{DataPacket, RayPacket, TCPPacket};
 use remote::{endpoint_in, endpoint_out, forward_in, forward_out, stat_request};
 use routing::Nodes;
 
@@ -120,7 +120,7 @@ async fn main() -> io::Result<()> {
         });
         info!("Started RayNet Forwarder");
     } else {
-        let (kcp_tx, kcp_rx) = mpsc::channel::<KCPPacket>(65536);
+        let (kcp_tx, kcp_rx) = mpsc::channel::<DataPacket>(65536);
         let (tcp_tx, tcp_rx) = mpsc::channel::<TCPPacket>(65536);
 
         // UDP input thread

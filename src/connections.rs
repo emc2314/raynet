@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
-use crate::packets::{KCPPacket, KcpOutput, KcpRecv, TCPPacket};
+use crate::packets::{DataPacket, KcpOutput, KcpRecv, TCPPacket};
 use crate::rkcp::session::KcpSession;
 use crate::rkcp::socket::KcpSocket;
 use crate::utils::UnwrapNone;
@@ -28,7 +28,7 @@ impl Connections {
     pub async fn assign_from_conv(
         self: &mut Connections,
         conv: u32,
-        kcp_tx: &Sender<KCPPacket>,
+        kcp_tx: &Sender<DataPacket>,
         tcp_tx: &Sender<TCPPacket>,
     ) -> Option<Arc<KcpSession>> {
         self.cons
@@ -64,7 +64,7 @@ impl Connections {
     pub async fn assign_from_addr(
         self: &mut Connections,
         addr: &SocketAddr,
-        kcp_tx: &Sender<KCPPacket>,
+        kcp_tx: &Sender<DataPacket>,
         tcp_tx: &Sender<TCPPacket>,
     ) -> Arc<KcpSession> {
         let conv = rand::thread_rng().gen::<u32>();

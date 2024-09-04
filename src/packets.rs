@@ -1,57 +1,38 @@
 use aegis::aegis128l::{Aegis128L, Key, Nonce, Tag};
+use num_enum::TryFromPrimitive;
 use rand::Rng;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::{io, net::SocketAddr};
 use tokio::sync::mpsc::{error, Sender};
 
 use crate::utils::{now_millis, NonceFilter};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, TryFromPrimitive)]
+#[repr(u8)]
 pub enum RayPacketType {
     DataPacket,
     StatRequest,
     StatResponse,
 }
-impl From<RayPacketType> for u8 {
-    fn from(value: RayPacketType) -> Self {
-        match value {
-            RayPacketType::DataPacket => 0,
-            RayPacketType::StatRequest => 1,
-            RayPacketType::StatResponse => 2,
-        }
-    }
-}
-impl TryFrom<u8> for RayPacketType {
-    type Error = ();
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(RayPacketType::DataPacket),
-            1 => Ok(RayPacketType::StatRequest),
-            2 => Ok(RayPacketType::StatResponse),
-            _ => Err(()),
-        }
-    }
-}
 
 #[derive(Debug)]
 pub struct RayPacket {
     pub ptype: RayPacketType,
-    pub kcp: KCPPacket,
+    pub data: DataPacket,
 }
 impl RayPacket {
     const HEADER_SIZE: usize = 33;
-    pub fn new(ptype: RayPacketType, kcp: KCPPacket) -> Self {
-        RayPacket { ptype, kcp }
+    pub fn new(ptype: RayPacketType, data: DataPacket) -> Self {
+        RayPacket { ptype, data }
     }
     pub fn encrypt(&self, key: &Key, out: &mut [u8]) -> usize {
         let nonce: Nonce = rand::thread_rng().gen();
         let cipher = Aegis128L::new(key, &nonce);
-        let rsize = self.kcp.data.len() + Self::HEADER_SIZE;
+        let rsize = self.data.data.len() + Self::HEADER_SIZE;
         out[0..16].copy_from_slice(&nonce);
-        out[32] = self.ptype.into();
-        out[Self::HEADER_SIZE..rsize].copy_from_slice(&self.kcp.data);
+        out[32] = self.ptype as u8;
+        out[Self::HEADER_SIZE..rsize].copy_from_slice(&self.data.data);
         let ad = (now_millis() >> 15).to_le_bytes();
         let tag: Tag<16> = cipher.encrypt_in_place(&mut out[32..rsize], &ad);
         out[16..32].copy_from_slice(&tag);
@@ -60,7 +41,7 @@ impl RayPacket {
     pub async fn decrypt(
         key: &Key,
         data: &[u8],
-        filter: Arc<NonceFilter>,
+        filter: &NonceFilter,
     ) -> Result<Self, RayPacketError> {
         if data.len() < Self::HEADER_SIZE || data.len() > 4096 {
             return Err(RayPacketError::BufLengthError);
@@ -86,7 +67,7 @@ impl RayPacket {
             })
             .map(|m| RayPacket {
                 ptype: m[0].try_into().unwrap(),
-                kcp: KCPPacket {
+                data: DataPacket {
                     data: m[1..].to_vec(),
                 },
             })
@@ -95,7 +76,7 @@ impl RayPacket {
 }
 
 #[derive(Debug)]
-pub struct KCPPacket {
+pub struct DataPacket {
     pub data: Vec<u8>,
 }
 
@@ -107,17 +88,17 @@ pub struct TCPPacket {
 
 #[derive(Debug)]
 pub struct KcpOutput {
-    tx: Sender<KCPPacket>,
+    tx: Sender<DataPacket>,
 }
 impl KcpOutput {
-    pub fn new(tx: Sender<KCPPacket>) -> Self {
+    pub fn new(tx: Sender<DataPacket>) -> Self {
         KcpOutput { tx }
     }
 }
 impl io::Write for KcpOutput {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         loop {
-            match self.tx.try_send(KCPPacket { data: buf.to_vec() }) {
+            match self.tx.try_send(DataPacket { data: buf.to_vec() }) {
                 Ok(_) => return Ok(buf.len()),
                 Err(error::TrySendError::Full(_)) => {
                     std::thread::yield_now();
