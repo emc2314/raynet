@@ -17,7 +17,7 @@ use crate::packets::{DataPacket, RayPacket, RayPacketError, RayPacketType, TCPPa
 use crate::routing::{Nodes, StatRequest, StatResponse, TimedCounter};
 use crate::utils::NonceFilter;
 
-async fn udp_send(
+async fn encrypt_and_send_udp(
     socket: &UdpSocket,
     remote: SocketAddr,
     packet: &RayPacket,
@@ -41,7 +41,7 @@ pub async fn stat_request(nodes: Arc<Nodes>, key: &Key, socket: Arc<UdpSocket>) 
     let mut index = 0;
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        debug!("Nodes: {:?}", nodes.nodes);
+        debug!("Total: {}, Nodes: {:?}", nodes.sum(), nodes.nodes);
         for node in nodes.nodes.iter() {
             let weight = node.weight.load(Relaxed);
             node.weight.store(weight * 0.8, Relaxed);
@@ -60,7 +60,7 @@ pub async fn stat_request(nodes: Arc<Nodes>, key: &Key, socket: Arc<UdpSocket>) 
                     }),
                 },
             );
-            udp_send(socket.as_ref(), node.addr, &packet, key, &mut buf).await;
+            encrypt_and_send_udp(socket.as_ref(), node.addr, &packet, key, &mut buf).await;
         }
         index += 1;
     }
@@ -104,6 +104,7 @@ fn stat_update(nodes: &Nodes, addr: SocketAddr, weight: f32) {
     for node in nodes.nodes.iter() {
         if node.addr.ip() == ip {
             node.weight.store(weight, Relaxed);
+            nodes.build_dist();
             flag = true;
             break;
         }
@@ -147,7 +148,7 @@ async fn udp_in<F, Fut>(
                                 tc.get() as f32,
                                 &packet.data.data,
                             );
-                            udp_send(&udp_socket, src, response, key, &mut buf).await;
+                            encrypt_and_send_udp(&udp_socket, src, response, key, &mut buf).await;
                         }
                         RayPacketType::StatResponse => {
                             let response: StatResponse =
@@ -239,12 +240,12 @@ where
     .unwrap();
     let mut buf = vec![0u8; 65535];
     while let Some(packet) = rx.recv().await {
-        let remote = nodes.route(&mut rand::thread_rng());
         let udp_socket_out = udp_socket_outs
             .iter()
             .choose(&mut rand::thread_rng())
             .unwrap();
-        udp_send(
+        let remote = nodes.route(&mut rand::thread_rng());
+        encrypt_and_send_udp(
             udp_socket_out,
             remote,
             &process_packet(packet),

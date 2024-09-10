@@ -1,9 +1,11 @@
+use arc_swap::ArcSwap;
 use atomic_float::AtomicF32;
 use bitcode::{Decode, Encode};
 use rand::distributions::{Distribution, WeightedIndex};
 use std::fmt::{self, Debug};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const BUCKET_NUM: usize = 64;
@@ -91,9 +93,11 @@ impl Debug for NodeInfo {
 #[derive(Debug)]
 pub struct Nodes {
     pub nodes: Vec<NodeInfo>,
+    dist: ArcSwap<WeightedIndex<f32>>,
 }
 impl Nodes {
     pub fn new(names: Vec<String>) -> Nodes {
+        let len = names.len();
         Nodes {
             nodes: names
                 .into_iter()
@@ -108,25 +112,27 @@ impl Nodes {
                     weight: AtomicF32::new(1.0),
                 })
                 .collect(),
+            dist: ArcSwap::from(Arc::new(WeightedIndex::new(vec![1.0; len]).unwrap())),
         }
     }
-    fn softmax(&self, rng: &mut rand::rngs::ThreadRng) -> usize {
+    pub fn build_dist(&self) {
         let exps = self
             .nodes
             .iter()
             .map(|x| (x.weight.load(Ordering::Relaxed) * 10.0).exp());
-        let sum: f32 = exps.clone().sum();
-        let dist = WeightedIndex::new(exps.map(|x| x / sum)).unwrap();
-        dist.sample(rng)
+        self.dist.store(Arc::new(WeightedIndex::new(exps).unwrap()));
     }
     pub fn route(&self, rng: &mut rand::rngs::ThreadRng) -> SocketAddr {
         let index = if self.nodes.len() > 1 {
-            self.softmax(rng)
+            self.dist.load().sample(rng)
         } else {
             0
         };
         self.nodes[index].tc.inc();
         self.nodes[index].addr
+    }
+    pub fn sum(&self) -> u32 {
+        self.nodes.iter().map(|x| x.tc.get()).sum()
     }
 }
 

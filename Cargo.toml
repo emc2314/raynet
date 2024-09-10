@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 aegis = "0.6.6"
+arc-swap = "1.7.1"
 atomic_float = "1.1.0"
 bitcode = "0.6.3"
 blake3 = "1.5.4"
@@ -32,6 +33,3 @@ codegen-units = 1
 lto = "fat"
 strip = "symbols"
 panic = "abort"
-
-[build]
-rustflags = ["-C", "target-cpu=native"]
