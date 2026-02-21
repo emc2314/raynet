@@ -12,7 +12,6 @@ use std::{
 
 use byte_string::ByteStr;
 use futures_util::{future, ready};
-use kcp::KcpResult;
 use log::{debug, error, trace, warn};
 use spin::Mutex as SpinMutex;
 use tokio::{
@@ -23,7 +22,8 @@ use tokio::{
     time::{self, Instant},
 };
 
-use crate::packets::KcpRecv;
+use crate::adapters::KcpRecv;
+use crate::kcp::{self, KcpResult};
 use crate::rkcp::socket::KcpSocket;
 
 pub struct KcpSession {

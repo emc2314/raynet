@@ -2,7 +2,6 @@ use aegis::aegis128l::Key;
 use futures::future::join_all;
 use log::{debug, error, warn};
 use rand::seq::IteratorRandom;
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -13,9 +12,12 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::time::Duration;
 
 use crate::connections::Connections;
-use crate::packets::{DataPacket, RayPacket, RayPacketError, RayPacketType, TCPPacket};
+use crate::core::{
+    apply_stat_update, build_stat_response, DataPacket, NonceFilter, RayPacket, RayPacketError,
+    RayPacketType, TCPPacket,
+};
+use crate::kcp;
 use crate::routing::{Nodes, StatRequest, StatResponse, TimedCounter};
-use crate::utils::NonceFilter;
 
 async fn encrypt_and_send_udp(
     socket: &UdpSocket,
@@ -66,54 +68,6 @@ pub async fn stat_request(nodes: Arc<Nodes>, key: &Key, socket: Arc<UdpSocket>) 
     }
 }
 
-fn stat_respond(endpoint: bool, nodes: &Nodes, tc: f32, data: &[u8]) -> RayPacket {
-    let max_next = if endpoint {
-        1.0
-    } else {
-        nodes
-            .nodes
-            .iter()
-            .map(|node| node.weight.load(Relaxed))
-            .max_by(|a, b| {
-                a.partial_cmp(b)
-                    .unwrap_or_else(|| match (a.is_nan(), b.is_nan()) {
-                        (true, true) => Ordering::Equal,
-                        (true, false) => Ordering::Less,
-                        (false, true) => Ordering::Greater,
-                        (false, false) => Ordering::Equal,
-                    })
-            })
-            .unwrap_or(1.0)
-    };
-    let request: StatRequest = bitcode::decode(data).unwrap();
-    let weight = (tc / (request.tc + 2.0)) * max_next;
-    RayPacket::new(
-        RayPacketType::StatResponse,
-        DataPacket {
-            data: bitcode::encode(&StatResponse {
-                index: request.index,
-                weight,
-            }),
-        },
-    )
-}
-
-fn stat_update(nodes: &Nodes, addr: SocketAddr, weight: f32) {
-    let mut flag = false;
-    let ip = addr.ip().to_canonical();
-    for node in nodes.nodes.iter() {
-        if node.addr.ip() == ip {
-            node.weight.store(weight, Relaxed);
-            nodes.build_dist();
-            flag = true;
-            break;
-        }
-    }
-    if !flag {
-        error!("Received weight from unknown node {}", addr);
-    }
-}
-
 async fn udp_in<F, Fut>(
     udp_socket: Arc<UdpSocket>,
     key: &Key,
@@ -125,7 +79,7 @@ async fn udp_in<F, Fut>(
     Fut: Future<Output = ()>,
 {
     let mut buf = vec![0u8; 65535];
-    let filter = NonceFilter::new(1 << 24, 0.00001, Duration::from_millis(1 << 16));
+    let mut filter = NonceFilter::new(1 << 24, 0.00001, Duration::from_millis(1 << 16));
     let mut imap = HashMap::<IpAddr, TimedCounter>::new();
     let mut curr_index = 0;
 
@@ -133,7 +87,7 @@ async fn udp_in<F, Fut>(
         match udp_socket.recv_from(&mut buf).await {
             Ok((size, src)) => {
                 debug!("Received {} bytes from {}", size, src);
-                match RayPacket::decrypt(key, &buf[..size], filter.as_ref()).await {
+                match RayPacket::decrypt(key, &buf[..size], &mut filter) {
                     Ok(packet) => match packet.ptype {
                         RayPacketType::DataPacket => {
                             imap.entry(src.ip()).or_insert_with(TimedCounter::new).inc();
@@ -142,7 +96,7 @@ async fn udp_in<F, Fut>(
                         RayPacketType::StatRequest => {
                             let tc = imap.entry(src.ip()).or_insert_with(TimedCounter::new);
                             tc.inc();
-                            let response = &stat_respond(
+                            let response = &build_stat_response(
                                 endpoint,
                                 nodes.as_ref(),
                                 tc.get() as f32,
@@ -154,7 +108,7 @@ async fn udp_in<F, Fut>(
                             let response: StatResponse =
                                 bitcode::decode(&packet.data.data).unwrap();
                             if response.index >= curr_index {
-                                stat_update(nodes.as_ref(), src, response.weight);
+                                apply_stat_update(nodes.as_ref(), src, response.weight);
                                 curr_index = response.index;
                             }
                         }

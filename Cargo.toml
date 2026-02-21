@@ -3,6 +3,9 @@ name = "raynet"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+fastack-conserve = []
+
 [dependencies]
 aegis = "0.6.6"
 arc-swap = "1.7.1"
@@ -15,7 +18,7 @@ env_logger = "0.11.5"
 fastbloom = "0.7.1"
 futures = "0.3.30"
 futures-util = "0.3.30"
-kcp = { git = "https://github.com/emc2314/kcp.git", features = ["tokio"] }
+bytes = "1.0"
 log = { version = "0.4", features = [
     "max_level_debug",
     "release_max_level_info",
@@ -27,6 +30,7 @@ serde = { version = "1.0.209", features = ["derive"] }
 spin = "0.9.8"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8.19"
+thiserror = "1.0"
 
 [profile.release]
 codegen-units = 1

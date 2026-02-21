@@ -6,10 +6,10 @@ use std::{
 };
 
 use futures_util::future;
-use kcp::{Error as KcpError, Kcp, KcpResult};
 use log::{debug, error};
 
-use crate::packets::KcpOutput;
+use crate::kcp::{Error as KcpError, Kcp, KcpResult};
+use crate::adapters::KcpOutput;
 use crate::utils::now_millis;
 
 /// Kcp Delay Config

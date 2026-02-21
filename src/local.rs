@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::time::{sleep, Duration};
 
 use crate::connections::Connections;
-use crate::packets::{DataPacket, TCPPacket};
+use crate::core::{DataPacket, TCPPacket};
 
 pub async fn endpoint_from(
     tcp_listener: TcpListener,

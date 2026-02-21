@@ -6,7 +6,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
-use crate::packets::{DataPacket, KcpOutput, KcpRecv, TCPPacket};
+use crate::adapters::{KcpOutput, KcpRecv};
+use crate::core::{DataPacket, TCPPacket};
 use crate::rkcp::session::KcpSession;
 use crate::rkcp::socket::KcpSocket;
 use crate::utils::UnwrapNone;

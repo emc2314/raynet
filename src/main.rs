@@ -9,9 +9,11 @@ use std::{fs, io};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, RwLock};
 
+mod adapters;
 mod connections;
+mod core;
+mod kcp;
 mod local;
-mod packets;
 mod remote;
 mod rkcp;
 mod routing;
@@ -19,7 +21,7 @@ mod utils;
 
 use connections::Connections;
 use local::{endpoint_from, endpoint_to};
-use packets::{DataPacket, RayPacket, TCPPacket};
+use crate::core::{DataPacket, RayPacket, TCPPacket};
 use remote::{endpoint_in, endpoint_out, forward_in, forward_out, stat_request};
 use routing::Nodes;
 
