@@ -8,9 +8,9 @@ use std::{
 use futures_util::future;
 use log::{debug, error};
 
-use crate::kcp::{Error as KcpError, Kcp, KcpResult};
 use crate::adapters::KcpOutput;
 use crate::utils::now_millis;
+use raynet_core::kcp::{Error as KcpError, Kcp, KcpResult};
 
 /// Kcp Delay Config
 #[derive(Debug, Clone, Copy)]
@@ -199,7 +199,7 @@ impl KcpSocket {
         self.last_update = Instant::now();
 
         if self.flush_ack_input {
-            self.kcp.async_flush_ack().await?;
+            self.kcp.flush_ack()?;
         }
 
         Ok(self.try_wake_pending_waker())
@@ -314,8 +314,8 @@ impl KcpSocket {
         future::poll_fn(|cx| self.poll_recv(cx, buf)).await
     }
 
-    pub async fn flush(&mut self) -> KcpResult<()> {
-        self.kcp.async_flush().await?;
+    pub fn flush(&mut self) -> KcpResult<()> {
+        self.kcp.flush()?;
         self.last_update = Instant::now();
         Ok(())
     }
@@ -348,9 +348,9 @@ impl KcpSocket {
         waked
     }
 
-    pub async fn update(&mut self) -> KcpResult<Instant> {
+    pub fn update(&mut self) -> KcpResult<Instant> {
         let now = now_millis() as u32;
-        self.kcp.async_update(now).await?;
+        self.kcp.update(now)?;
         let next = self.kcp.check(now);
 
         self.try_wake_pending_waker();

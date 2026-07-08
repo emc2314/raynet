@@ -1,5 +1,5 @@
 use log::info;
-use rand::Rng;
+use rand::RngExt;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::net::SocketAddr;
@@ -7,10 +7,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
 use crate::adapters::{KcpOutput, KcpRecv};
-use crate::core::{DataPacket, TCPPacket};
 use crate::rkcp::session::KcpSession;
 use crate::rkcp::socket::KcpSocket;
-use crate::utils::UnwrapNone;
+use raynet_core::core::{DataPacket, TCPPacket};
+use raynet_core::utils::UnwrapNone;
 
 pub struct Connections {
     cons: HashMap<SocketAddr, tokio::net::tcp::OwnedWriteHalf>,
@@ -68,7 +68,7 @@ impl Connections {
         kcp_tx: &Sender<DataPacket>,
         tcp_tx: &Sender<TCPPacket>,
     ) -> Arc<KcpSession> {
-        let conv = rand::thread_rng().gen::<u32>();
+        let conv = rand::rng().random::<u32>();
         let config = Default::default();
         let kcp = KcpSocket::new(&config, conv, KcpOutput::new(kcp_tx.clone()), true).unwrap();
         let session = KcpSession::new_shared(

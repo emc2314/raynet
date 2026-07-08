@@ -1,12 +1,11 @@
 use arc_swap::ArcSwap;
 use atomic_float::AtomicF32;
 use bitcode::{Decode, Encode};
-use rand::distributions::{Distribution, WeightedIndex};
+use rand::distr::{Distribution, weighted::WeightedIndex};
 use std::fmt::{self, Debug};
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 const BUCKET_NUM: usize = 64;
 #[derive(Debug)]
@@ -16,55 +15,46 @@ pub struct TimedCounter {
 }
 
 impl TimedCounter {
-    const WINDOW_NANOS: u64 = 4294967296;
-    const BUCKET_LENGTH: u64 = Self::WINDOW_NANOS / BUCKET_NUM as u64;
+    const WINDOW_MS: u64 = 4096;
+    const BUCKET_LENGTH: u64 = Self::WINDOW_MS / BUCKET_NUM as u64;
 
-    pub fn new() -> Self {
+    pub fn new(time_ms: u64) -> Self {
         TimedCounter {
             buffer: [(); BUCKET_NUM].map(|_| AtomicU32::new(0)),
-            last_update: AtomicU64::new(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as u64,
-            ),
+            last_update: AtomicU64::new(time_ms),
         }
     }
 
-    pub fn add(&self, count: u32) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+    pub fn add(&self, time_ms: u64, count: u32) {
         let last_update = self.last_update.load(Ordering::Relaxed);
-        let current_index = ((now / Self::BUCKET_LENGTH) % BUCKET_NUM as u64) as usize;
+        let current_index = ((time_ms / Self::BUCKET_LENGTH) % BUCKET_NUM as u64) as usize;
 
         for i in 0..BUCKET_NUM {
             let index = (current_index + BUCKET_NUM - i) % BUCKET_NUM;
-            if now - (now % Self::BUCKET_LENGTH) <= last_update + i as u64 * Self::BUCKET_LENGTH {
+            if time_ms - (time_ms % Self::BUCKET_LENGTH)
+                <= last_update + i as u64 * Self::BUCKET_LENGTH
+            {
                 break;
             }
             self.buffer[index].store(0, Ordering::Relaxed);
         }
         self.buffer[current_index].fetch_add(count, Ordering::Relaxed);
-        self.last_update.store(now, Ordering::Relaxed);
+        self.last_update.store(time_ms, Ordering::Relaxed);
     }
 
-    pub fn inc(&self) {
-        self.add(1);
+    pub fn inc(&self, time_ms: u64) {
+        self.add(time_ms, 1);
     }
 
-    pub fn get(&self) -> u32 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        let current_index = ((now / Self::BUCKET_LENGTH) % BUCKET_NUM as u64) as usize;
+    pub fn get(&self, time_ms: u64) -> u32 {
+        let current_index = ((time_ms / Self::BUCKET_LENGTH) % BUCKET_NUM as u64) as usize;
         let last_update = self.last_update.load(Ordering::Relaxed);
         let mut total = 0;
 
         for i in 0..BUCKET_NUM {
-            if now - (now % Self::BUCKET_LENGTH) <= last_update + i as u64 * Self::BUCKET_LENGTH {
+            if time_ms - (time_ms % Self::BUCKET_LENGTH)
+                <= last_update + i as u64 * Self::BUCKET_LENGTH
+            {
                 let index = (current_index + BUCKET_NUM - i) % BUCKET_NUM;
                 total += self.buffer[index].load(Ordering::Relaxed);
             }
@@ -85,7 +75,6 @@ impl Debug for NodeInfo {
         f.debug_struct("NodeInfo")
             .field("name", &self.name)
             .field("addr", &self.addr)
-            .field("tc", &self.tc.get())
             .field("weight", &self.weight.load(Ordering::Relaxed))
             .finish()
     }
@@ -96,7 +85,7 @@ pub struct Nodes {
     dist: ArcSwap<WeightedIndex<f32>>,
 }
 impl Nodes {
-    pub fn new(names: Vec<String>) -> Nodes {
+    pub fn new(names: Vec<String>, time_ms: u64) -> Nodes {
         let len = names.len();
         Nodes {
             nodes: names
@@ -108,7 +97,7 @@ impl Nodes {
                         .expect("Unable to resolve send address")
                         .next()
                         .unwrap(),
-                    tc: TimedCounter::new(),
+                    tc: TimedCounter::new(time_ms),
                     weight: AtomicF32::new(1.0),
                 })
                 .collect(),
@@ -122,17 +111,17 @@ impl Nodes {
             .map(|x| (x.weight.load(Ordering::Relaxed) * 10.0).exp());
         self.dist.store(Arc::new(WeightedIndex::new(exps).unwrap()));
     }
-    pub fn route(&self, rng: &mut rand::rngs::ThreadRng) -> SocketAddr {
+    pub fn route<R: rand::Rng + ?Sized>(&self, time_ms: u64, rng: &mut R) -> SocketAddr {
         let index = if self.nodes.len() > 1 {
             self.dist.load().sample(rng)
         } else {
             0
         };
-        self.nodes[index].tc.inc();
+        self.nodes[index].tc.inc(time_ms);
         self.nodes[index].addr
     }
-    pub fn sum(&self) -> u32 {
-        self.nodes.iter().map(|x| x.tc.get()).sum()
+    pub fn sum(&self, time_ms: u64) -> u32 {
+        self.nodes.iter().map(|x| x.tc.get(time_ms)).sum()
     }
 }
 

@@ -5,15 +5,12 @@ use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fmt::{self, Debug};
 use std::io::{self, Cursor, Read, Write};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
 use bytes::{Buf, BufMut, BytesMut};
 use log::{debug, trace};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use super::error::Error;
 use super::KcpResult;
+use super::error::Error;
 
 const KCP_RTO_NDL: u32 = 30; // no delay min rto
 const KCP_RTO_MIN: u32 = 100; // normal min rto
@@ -149,37 +146,6 @@ impl<O: Write> Write for KcpOutput<O> {
     #[inline]
     fn flush(&mut self) -> io::Result<()> {
         self.0.flush()
-    }
-}
-
-impl<O: AsyncWrite + Unpin> AsyncWrite for KcpOutput<O> {
-    #[inline(always)]
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write(cx, buf)
-    }
-    #[inline(always)]
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_flush(cx)
-    }
-    #[inline(always)]
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_shutdown(cx)
-    }
-    #[inline(always)]
-    fn poll_write_vectored(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[io::IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write_vectored(cx, bufs)
-    }
-    #[inline(always)]
-    fn is_write_vectored(&self) -> bool {
-        self.0.is_write_vectored()
     }
 }
 
@@ -487,9 +453,7 @@ impl<Output> Kcp<Output> {
 
                     trace!(
                         "send stream mss={} last length={} extend={}",
-                        self.mss,
-                        l,
-                        extend
+                        self.mss, l, extend
                     );
 
                     let (lf, rt) = buf.split_at(extend);
@@ -606,7 +570,7 @@ impl<Output> Kcp<Output> {
                     seg.fastack += 1;
                 }
                 #[cfg(not(feature = "fastack-conserve"))]
-                if timediff(ts, seg.ts) >= 0 {
+                if timediff(_ts, seg.ts) >= 0 {
                     seg.fastack += 1;
                 }
             }
@@ -1210,13 +1174,14 @@ impl<Output: Write> Kcp<Output> {
                 snd_segment.resendts = self.current + snd_segment.rto;
                 lost = true;
             } else if snd_segment.fastack >= resent
-                && (snd_segment.xmit <= self.fastlimit || self.fastlimit == 0) {
-                    need_send = true;
-                    snd_segment.xmit += 1;
-                    snd_segment.fastack = 0;
-                    snd_segment.resendts = self.current + snd_segment.rto;
-                    change += 1;
-                }
+                && (snd_segment.xmit <= self.fastlimit || self.fastlimit == 0)
+            {
+                need_send = true;
+                snd_segment.xmit += 1;
+                snd_segment.fastack = 0;
+                snd_segment.resendts = self.current + snd_segment.rto;
+                change += 1;
+            }
 
             if need_send {
                 snd_segment.ts = self.current;
@@ -1296,245 +1261,6 @@ impl<Output: Write> Kcp<Output> {
                 self.ts_flush = self.current + self.interval;
             }
             self.flush()?;
-        }
-
-        Ok(())
-    }
-}
-
-impl<Output: AsyncWrite + Unpin> Kcp<Output> {
-    async fn _async_flush_ack(&mut self, segment: &mut KcpSegment) -> KcpResult<()> {
-        // flush acknowledges
-        // while let Some((sn, ts)) = self.acklist.pop_front() {
-        for &(sn, ts) in &self.acklist {
-            if self.buf.len() + KCP_OVERHEAD > self.mtu {
-                self.output.write_all(&self.buf).await?;
-                self.buf.clear();
-            }
-            segment.sn = sn;
-            segment.ts = ts;
-            segment.encode(&mut self.buf);
-        }
-        self.acklist.clear();
-
-        Ok(())
-    }
-
-    async fn _async_flush_probe_commands(
-        &mut self,
-        cmd: u8,
-        segment: &mut KcpSegment,
-    ) -> KcpResult<()> {
-        segment.cmd = cmd;
-        if self.buf.len() + KCP_OVERHEAD > self.mtu {
-            self.output.write_all(&self.buf).await?;
-            self.buf.clear();
-        }
-        segment.encode(&mut self.buf);
-        Ok(())
-    }
-
-    async fn async_flush_probe_commands(&mut self, segment: &mut KcpSegment) -> KcpResult<()> {
-        // flush window probing commands
-        if (self.probe & KCP_ASK_SEND) != 0 {
-            self._async_flush_probe_commands(KCP_CMD_WASK, segment)
-                .await?;
-        }
-
-        // flush window probing commands
-        if (self.probe & KCP_ASK_TELL) != 0 {
-            self._async_flush_probe_commands(KCP_CMD_WINS, segment)
-                .await?;
-        }
-        self.probe = 0;
-        Ok(())
-    }
-
-    /// Flush pending ACKs
-    pub async fn async_flush_ack(&mut self) -> KcpResult<()> {
-        if !self.updated {
-            debug!("flush updated() must be called at least once");
-            return Err(Error::NeedUpdate);
-        }
-
-        let mut segment = KcpSegment {
-            conv: self.conv,
-            cmd: KCP_CMD_ACK,
-            wnd: self.wnd_unused(),
-            una: self.rcv_nxt,
-            ..Default::default()
-        };
-
-        self._async_flush_ack(&mut segment).await
-    }
-
-    /// Flush pending data in buffer.
-    pub async fn async_flush(&mut self) -> KcpResult<()> {
-        if !self.updated {
-            debug!("flush updated() must be called at least once");
-            return Err(Error::NeedUpdate);
-        }
-
-        let mut segment = KcpSegment {
-            conv: self.conv,
-            cmd: KCP_CMD_ACK,
-            wnd: self.wnd_unused(),
-            una: self.rcv_nxt,
-            ..Default::default()
-        };
-
-        self._async_flush_ack(&mut segment).await?;
-        self.probe_wnd_size();
-        self.async_flush_probe_commands(&mut segment).await?;
-
-        // println!("SNDBUF size {}", self.snd_buf.len());
-
-        // calculate window size
-        let mut cwnd = cmp::min(self.snd_wnd, self.rmt_wnd);
-        if !self.nocwnd {
-            cwnd = cmp::min(self.cwnd, cwnd);
-        }
-
-        // move data from snd_queue to snd_buf
-        while timediff(self.snd_nxt, self.snd_una + cwnd as u32) < 0 {
-            match self.snd_queue.pop_front() {
-                Some(mut new_segment) => {
-                    new_segment.conv = self.conv;
-                    new_segment.cmd = KCP_CMD_PUSH;
-                    new_segment.wnd = segment.wnd;
-                    new_segment.ts = self.current;
-                    new_segment.sn = self.snd_nxt;
-                    self.snd_nxt += 1;
-                    new_segment.una = self.rcv_nxt;
-                    new_segment.resendts = self.current;
-                    new_segment.rto = self.rx_rto;
-                    new_segment.fastack = 0;
-                    new_segment.xmit = 0;
-                    self.snd_buf.push_back(new_segment);
-                }
-                None => break,
-            }
-        }
-
-        // calculate resent
-        let resent = if self.fastresend > 0 {
-            self.fastresend
-        } else {
-            u32::MAX
-        };
-
-        let rtomin = if !self.nodelay { self.rx_rto >> 3 } else { 0 };
-
-        let mut lost = false;
-        let mut change = 0;
-
-        for snd_segment in &mut self.snd_buf {
-            let mut need_send = false;
-
-            if snd_segment.xmit == 0 {
-                need_send = true;
-                snd_segment.xmit += 1;
-                snd_segment.rto = self.rx_rto;
-                snd_segment.resendts = self.current + snd_segment.rto + rtomin;
-            } else if timediff(self.current, snd_segment.resendts) >= 0 {
-                need_send = true;
-                snd_segment.xmit += 1;
-                self.xmit += 1;
-                if !self.nodelay {
-                    snd_segment.rto += cmp::max(snd_segment.rto, self.rx_rto);
-                } else {
-                    let step = snd_segment.rto; // (kcp->nodelay < 2) ? ((IINT32)(segment->rto)) : kcp->rx_rto;
-                    snd_segment.rto += step / 2;
-                }
-                snd_segment.resendts = self.current + snd_segment.rto;
-                lost = true;
-            } else if snd_segment.fastack >= resent
-                && (snd_segment.xmit <= self.fastlimit || self.fastlimit == 0) {
-                    need_send = true;
-                    snd_segment.xmit += 1;
-                    snd_segment.fastack = 0;
-                    snd_segment.resendts = self.current + snd_segment.rto;
-                    change += 1;
-                }
-
-            if need_send {
-                snd_segment.ts = self.current;
-                snd_segment.wnd = segment.wnd;
-                snd_segment.una = self.rcv_nxt;
-
-                let need = KCP_OVERHEAD + snd_segment.data.len();
-
-                if self.buf.len() + need > self.mtu {
-                    self.output.write_all(&self.buf).await?;
-                    self.buf.clear();
-                }
-
-                snd_segment.encode(&mut self.buf);
-
-                if snd_segment.xmit >= self.dead_link {
-                    self.state = -1; // (IUINT32)-1
-                }
-            }
-        }
-
-        // Flush all data in buffer
-        if !self.buf.is_empty() {
-            self.output.write_all(&self.buf).await?;
-            self.buf.clear();
-        }
-
-        // update ssthresh
-        if change > 0 {
-            let inflight = self.snd_nxt - self.snd_una;
-            self.ssthresh = inflight as u16 / 2;
-            if self.ssthresh < KCP_THRESH_MIN {
-                self.ssthresh = KCP_THRESH_MIN;
-            }
-            self.cwnd = self.ssthresh + resent as u16;
-            self.incr = self.cwnd as usize * self.mss;
-        }
-
-        if lost {
-            self.ssthresh = cwnd / 2;
-            if self.ssthresh < KCP_THRESH_MIN {
-                self.ssthresh = KCP_THRESH_MIN;
-            }
-            self.cwnd = 1;
-            self.incr = self.mss;
-        }
-
-        if self.cwnd < 1 {
-            self.cwnd = 1;
-            self.incr = self.mss;
-        }
-
-        Ok(())
-    }
-
-    /// Update state every 10ms ~ 100ms.
-    ///
-    /// Or you can ask `check` when to call this again.
-    pub async fn async_update(&mut self, current: u32) -> KcpResult<()> {
-        self.current = current;
-
-        if !self.updated {
-            self.updated = true;
-            self.ts_flush = self.current;
-        }
-
-        let mut slap = timediff(self.current, self.ts_flush);
-
-        if !(-10000..10000).contains(&slap) {
-            self.ts_flush = self.current;
-            slap = 0;
-        }
-
-        if slap >= 0 {
-            self.ts_flush += self.interval;
-            if timediff(self.current, self.ts_flush) >= 0 {
-                self.ts_flush = self.current + self.interval;
-            }
-            self.async_flush().await?;
         }
 
         Ok(())

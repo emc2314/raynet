@@ -5,19 +5,20 @@ use rand::seq::IteratorRandom;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio::time::Duration;
 
 use crate::connections::Connections;
-use crate::core::{
-    apply_stat_update, build_stat_response, DataPacket, NonceFilter, RayPacket, RayPacketError,
-    RayPacketType, TCPPacket,
+use crate::utils::now_millis;
+use raynet_core::core::{
+    DataPacket, NonceFilter, RayPacket, RayPacketError, RayPacketType, TCPPacket,
+    apply_stat_update, build_stat_response,
 };
-use crate::kcp;
-use crate::routing::{Nodes, StatRequest, StatResponse, TimedCounter};
+use raynet_core::kcp;
+use raynet_core::routing::{Nodes, StatRequest, StatResponse, TimedCounter};
 
 async fn encrypt_and_send_udp(
     socket: &UdpSocket,
@@ -26,7 +27,7 @@ async fn encrypt_and_send_udp(
     key: &Key,
     buf: &mut [u8],
 ) {
-    let rsize = packet.encrypt(key, buf);
+    let rsize = packet.encrypt(now_millis(), key, buf);
     match socket.send_to(&buf[..rsize], remote).await {
         Ok(sent_size) => {
             debug!("Sent {} bytes to {}", sent_size, remote);
@@ -43,7 +44,8 @@ pub async fn stat_request(nodes: Arc<Nodes>, key: &Key, socket: Arc<UdpSocket>) 
     let mut index = 0;
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        debug!("Total: {}, Nodes: {:?}", nodes.sum(), nodes.nodes);
+        let now = now_millis();
+        debug!("Total: {}, Nodes: {:?}", nodes.sum(now), nodes.nodes);
         for node in nodes.nodes.iter() {
             let weight = node.weight.load(Relaxed);
             node.weight.store(weight * 0.8, Relaxed);
@@ -52,13 +54,13 @@ pub async fn stat_request(nodes: Arc<Nodes>, key: &Key, socket: Arc<UdpSocket>) 
             }
         }
         for node in nodes.nodes.iter() {
-            node.tc.inc();
+            node.tc.inc(now);
             let packet = RayPacket::new(
                 RayPacketType::StatRequest,
                 DataPacket {
                     data: bitcode::encode(&StatRequest {
                         index,
-                        tc: node.tc.get() as f32,
+                        tc: node.tc.get(now) as f32,
                     }),
                 },
             );
@@ -79,27 +81,32 @@ async fn udp_in<F, Fut>(
     Fut: Future<Output = ()>,
 {
     let mut buf = vec![0u8; 65535];
-    let mut filter = NonceFilter::new(1 << 24, 0.00001, Duration::from_millis(1 << 16));
+    let mut filter = NonceFilter::new(1 << 24, 0.00001, 1 << 16, now_millis());
     let mut imap = HashMap::<IpAddr, TimedCounter>::new();
     let mut curr_index = 0;
 
     loop {
         match udp_socket.recv_from(&mut buf).await {
             Ok((size, src)) => {
+                let now = now_millis();
                 debug!("Received {} bytes from {}", size, src);
-                match RayPacket::decrypt(key, &buf[..size], &mut filter) {
+                match RayPacket::decrypt(now, key, &buf[..size], &mut filter) {
                     Ok(packet) => match packet.ptype {
                         RayPacketType::DataPacket => {
-                            imap.entry(src.ip()).or_insert_with(TimedCounter::new).inc();
+                            imap.entry(src.ip())
+                                .or_insert_with(|| TimedCounter::new(now))
+                                .inc(now);
                             process_packet(packet).await;
                         }
                         RayPacketType::StatRequest => {
-                            let tc = imap.entry(src.ip()).or_insert_with(TimedCounter::new);
-                            tc.inc();
+                            let tc = imap
+                                .entry(src.ip())
+                                .or_insert_with(|| TimedCounter::new(now));
+                            tc.inc(now);
                             let response = &build_stat_response(
                                 endpoint,
                                 nodes.as_ref(),
-                                tc.get() as f32,
+                                tc.get(now) as f32,
                                 &packet.data.data,
                             );
                             encrypt_and_send_udp(&udp_socket, src, response, key, &mut buf).await;
@@ -152,18 +159,17 @@ pub async fn endpoint_in(
     let process_endpoint = |packet: RayPacket| async {
         let packet = packet.data;
         let conv = kcp::get_conv(&packet.data);
-        let session = {
+        let session = if let Some(session) = {
             let con = connections.read().await;
-            if let Some(kcp) = con.get_from_conv(conv) {
-                Some(kcp)
-            } else {
-                drop(con);
-                connections
-                    .write()
-                    .await
-                    .assign_from_conv(conv, &kcp_tx, &tcp_tx)
-                    .await
-            }
+            con.get_from_conv(conv)
+        } {
+            Some(session)
+        } else {
+            connections
+                .write()
+                .await
+                .assign_from_conv(conv, &kcp_tx, &tcp_tx)
+                .await
         };
         if let Some(session) = session {
             if session.input(&packet.data).await.is_err() {
@@ -194,15 +200,18 @@ where
     .unwrap();
     let mut buf = vec![0u8; 65535];
     while let Some(packet) = rx.recv().await {
-        let udp_socket_out = udp_socket_outs
-            .iter()
-            .choose(&mut rand::thread_rng())
-            .unwrap();
-        let remote = nodes.route(&mut rand::thread_rng());
+        let (udp_socket_index, remote) = {
+            let mut rng = rand::rng();
+            (
+                (0..udp_socket_outs.len()).choose(&mut rng).unwrap(),
+                nodes.route(now_millis(), &mut rng),
+            )
+        };
+        let packet = process_packet(packet);
         encrypt_and_send_udp(
-            udp_socket_out,
+            &udp_socket_outs[udp_socket_index],
             remote,
-            &process_packet(packet),
+            &packet,
             key,
             &mut buf,
         )

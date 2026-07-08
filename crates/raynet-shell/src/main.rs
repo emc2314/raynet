@@ -6,24 +6,20 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::Arc;
 use std::{fs, io};
-use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{mpsc, RwLock};
+use tokio::net::UdpSocket;
 
 mod adapters;
 mod connections;
-mod core;
-mod kcp;
+mod endpoint;
 mod local;
+mod relay;
 mod remote;
 mod rkcp;
-mod routing;
 mod utils;
 
-use connections::Connections;
-use local::{endpoint_from, endpoint_to};
-use crate::core::{DataPacket, RayPacket, TCPPacket};
-use remote::{endpoint_in, endpoint_out, forward_in, forward_out, stat_request};
-use routing::Nodes;
+use raynet_core::routing::Nodes;
+use remote::stat_request;
+use utils::now_millis;
 
 use mimalloc::MiMalloc;
 #[global_allocator]
@@ -84,6 +80,7 @@ async fn main() -> io::Result<()> {
         cli.send
             .or(file_config.send)
             .unwrap_or_else(|| vec!["[::1]:8443".to_string()]),
+        now_millis(),
     ));
     let key = blake3::derive_key(
         "RayNet PSK v1",
@@ -95,7 +92,6 @@ async fn main() -> io::Result<()> {
         .try_into()
         .unwrap();
 
-    let connections = Arc::new(RwLock::new(Connections::new()));
     let udp_socket = Arc::new(UdpSocket::bind(listen_addr).await?);
 
     {
@@ -106,63 +102,17 @@ async fn main() -> io::Result<()> {
         });
     }
 
-    if !endpoint {
-        let (ray_tx, ray_rx) = mpsc::channel::<RayPacket>(65536);
-        // Input thread
-        {
-            let nodes = nodes.clone();
-            tokio::spawn(async move {
-                forward_in(udp_socket, ray_tx, &key, nodes).await;
-            });
-        }
-
-        // Output thread
-        tokio::spawn(async move {
-            forward_out(ray_rx, nodes, &key).await;
-        });
-        info!("Started RayNet Forwarder");
+    let connections = if !endpoint {
+        relay::run(udp_socket, nodes, key).await?;
+        None
     } else {
-        let (kcp_tx, kcp_rx) = mpsc::channel::<DataPacket>(65536);
-        let (tcp_tx, tcp_rx) = mpsc::channel::<TCPPacket>(65536);
-
-        // UDP input thread
-        {
-            let connections = connections.clone();
-            let kcp_tx = kcp_tx.clone();
-            let tcp_tx = tcp_tx.clone();
-            let nodes = nodes.clone();
-            tokio::spawn(async move {
-                endpoint_in(udp_socket, kcp_tx, connections, tcp_tx, &key, nodes).await;
-            });
-        }
-
-        // TCP listener thread
-        {
-            let tcp_listener = TcpListener::bind(listen_addr).await?;
-            let connections = connections.clone();
-            tokio::spawn(async move {
-                endpoint_from(tcp_listener, kcp_tx, connections, tcp_tx).await;
-            });
-        }
-        // Output thread
-        let connections = connections.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async move {
-                tokio::spawn(async move {
-                    endpoint_to(connections, tcp_rx).await;
-                });
-                tokio::spawn(async move {
-                    endpoint_out(kcp_rx, nodes, &key).await;
-                });
-                let _ = tokio::signal::ctrl_c().await;
-            });
-        });
-        info!("Started RayNet Endpoint");
-    }
+        Some(endpoint::run(listen_addr, udp_socket, nodes, key).await?)
+    };
 
     tokio::signal::ctrl_c().await?;
     info!("Ctrl-C received, shutting down");
-    debug!("{:?}", connections.read().await);
+    if let Some(connections) = connections {
+        debug!("{:?}", connections.read().await);
+    }
     Ok(())
 }

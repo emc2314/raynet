@@ -2,11 +2,11 @@ use log::{debug, error, info};
 use std::io;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, RwLock};
-use tokio::time::{sleep, Duration};
+use tokio::sync::{RwLock, mpsc};
+use tokio::time::{Duration, sleep};
 
 use crate::connections::Connections;
-use crate::core::{DataPacket, TCPPacket};
+use raynet_core::core::{DataPacket, TCPPacket};
 
 pub async fn endpoint_from(
     tcp_listener: TcpListener,
@@ -37,18 +37,17 @@ pub async fn endpoint_from(
                             }
                             Ok(len) => {
                                 debug!("Received {} bytes from TCP {}", len, src);
-                                let session = {
+                                let session = if let Some(session) = {
                                     let con = connections.read().await;
-                                    if let Some(kcp) = con.get_from_addr(&src) {
-                                        kcp
-                                    } else {
-                                        drop(con);
-                                        connections
-                                            .write()
-                                            .await
-                                            .assign_from_addr(&src, &kcp_tx, &tcp_tx)
-                                            .await
-                                    }
+                                    con.get_from_addr(&src)
+                                } {
+                                    session
+                                } else {
+                                    connections
+                                        .write()
+                                        .await
+                                        .assign_from_addr(&src, &kcp_tx, &tcp_tx)
+                                        .await
                                 };
                                 if let Err(e) = session.send(&buf[..len]).await {
                                     error!("KCP session {} error when send: {}", session.conv(), e);
@@ -79,28 +78,38 @@ pub async fn endpoint_to(
 ) {
     while let Some(packet) = tcp_rx.recv().await {
         let addr = packet.addr;
-        if let Some(tcp_write) = connections.read().await.get(&addr) {
-            let mut data = packet.data.as_slice();
-            while !data.is_empty() {
-                match tcp_write.try_write(data) {
-                    Ok(n) => {
-                        debug!("Forwarded {} bytes to TCP stream {}", n, addr);
-                        data = &data[n..];
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        sleep(Duration::from_millis(1)).await;
-                    }
-                    Err(e) => {
-                        error!("Failed to write to TCP stream {}: {}", addr, e);
-                        let mut con = connections.write().await;
-                        con.close(&addr);
-                        con.remove(&addr);
-                        break;
+        let should_close = {
+            let con = connections.read().await;
+            if let Some(tcp_write) = con.get(&addr) {
+                let mut data = packet.data.as_slice();
+                let mut should_close = false;
+                while !data.is_empty() {
+                    match tcp_write.try_write(data) {
+                        Ok(n) => {
+                            debug!("Forwarded {} bytes to TCP stream {}", n, addr);
+                            data = &data[n..];
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            sleep(Duration::from_millis(1)).await;
+                        }
+                        Err(e) => {
+                            error!("Failed to write to TCP stream {}: {}", addr, e);
+                            should_close = true;
+                            break;
+                        }
                     }
                 }
+                should_close
+            } else {
+                error!("No spare connection");
+                false
             }
-        } else {
-            error!("No spare connection");
+        };
+
+        if should_close {
+            let mut con = connections.write().await;
+            con.close(&addr);
+            con.remove(&addr);
         }
     }
 }

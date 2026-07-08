@@ -3,9 +3,9 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use tokio::sync::mpsc::{error, Sender};
+use tokio::sync::mpsc::{Sender, error};
 
-use crate::core::packet::{DataPacket, TCPPacket};
+use raynet_core::core::packet::{DataPacket, TCPPacket};
 
 /// Tokio mpsc adapter used as KCP output target.
 pub struct KcpOutput {

@@ -3,8 +3,8 @@ use std::{
     io::ErrorKind,
     ops::Deref,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
     time::Duration,
@@ -16,15 +16,15 @@ use log::{debug, error, trace, warn};
 use spin::Mutex as SpinMutex;
 use tokio::{
     sync::{
-        mpsc::{self, error::TrySendError},
         Notify,
+        mpsc::{self, error::TrySendError},
     },
     time::{self, Instant},
 };
 
 use crate::adapters::KcpRecv;
-use crate::kcp::{self, KcpResult};
 use crate::rkcp::socket::KcpSocket;
+use raynet_core::kcp::{self, KcpResult};
 
 pub struct KcpSession {
     socket: SpinMutex<KcpSocket>,
@@ -133,12 +133,19 @@ impl KcpSession {
 
                         match socket.input(&input_buffer).await {
                             Ok(waked) => {
-                                debug!("[SESSION] KCP input {} bytes from channel, waked? {} sender/receiver",
-                                                       input_buffer.len(), waked);
+                                debug!(
+                                    "[SESSION] KCP input {} bytes from channel, waked? {} sender/receiver",
+                                    input_buffer.len(),
+                                    waked
+                                );
                             }
                             Err(err) => {
-                                error!("[SESSION] KCP input {} bytes from channel failed, error: {}, input buffer {:?}",
-                                                       input_buffer.len(), err, ByteStr::new(&input_buffer));
+                                error!(
+                                    "[SESSION] KCP input {} bytes from channel failed, error: {}, input buffer {:?}",
+                                    input_buffer.len(),
+                                    err,
+                                    ByteStr::new(&input_buffer)
+                                );
                             }
                         }
                         session.notify();
@@ -202,12 +209,12 @@ impl KcpSession {
 
                         // If window is full, flush it immediately
                         if socket.need_flush() {
-                            if let Err(e) = socket.flush().await {
+                            if let Err(e) = socket.flush() {
                                 error!("[SESSION] Flush failed, error: {}", e);
                             }
                         }
 
-                        match socket.update().await {
+                        match socket.update() {
                             Ok(next_next) => Instant::from_std(next_next),
                             Err(err) => {
                                 error!("[SESSION] KCP update failed, error: {}", err);
@@ -216,7 +223,11 @@ impl KcpSession {
                         }
                     };
 
-                    if session.recv(&mut recv_buffer, &mut recv_buffer_size).await.is_err() {
+                    if session
+                        .recv(&mut recv_buffer, &mut recv_buffer_size)
+                        .await
+                        .is_err()
+                    {
                         error!(
                             "[SESSION] Recv thread send data failed for session {}",
                             session.conv()

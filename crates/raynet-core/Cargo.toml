@@ -1,0 +1,19 @@
+[package]
+name = "raynet-core"
+version.workspace = true
+edition.workspace = true
+
+[features]
+fastack-conserve = []
+
+[dependencies]
+aegis.workspace = true
+arc-swap.workspace = true
+atomic_float.workspace = true
+bitcode.workspace = true
+bytes.workspace = true
+fastbloom.workspace = true
+log.workspace = true
+num_enum.workspace = true
+rand.workspace = true
+thiserror.workspace = true
