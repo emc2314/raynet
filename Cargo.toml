@@ -2,6 +2,7 @@
 members = [
     "crates/raynet-core",
     "crates/raynet-shell",
+    "crates/raynet-test-shell",
 ]
 resolver = "2"
 

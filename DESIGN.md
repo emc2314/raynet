@@ -2,15 +2,20 @@
 
 ## 1. 当前目标
 
-RayNet 是一个由 Rust core 和 runtime shell 共同组成的 overlay network。Core 是同步状态机，负责协议、加密、KCP、stream mux、relay forwarding 和 channel 调度。Shell 负责真实 IO、timer、配置、日志、ingress 和 exit connector。
+RayNet 是一个由 Rust core 和 runtime shell 共同组成的 overlay network。
 
-当前设计聚焦三件事：
+Core 是同步状态机，负责协议状态、加密、KCP session、relay forwarding 和单向 route plan 调度。Shell 负责真实 IO、timer、配置加载、启动熵、日志、ingress connector 和 exit connector。
 
-1. Entry endpoint 接收本地应用连接，选择穿越网络的 channel plan。
-2. Relay 按 envelope 转发，不理解 endpoint payload。
-3. Exit endpoint 连接被代理的真实服务，并把返回流量送回 entry。
+1. Entry endpoint 接收本地连接，把它变成一个 endpoint session。
+2. Endpoint 发送 packet 时使用一个单向 `RoutePlan`。
+3. Relay 消费 `RoutePlan` 的第一项并转发，endpoint payload 始终由 endpoint 处理。
+4. Exit endpoint 为远端 session 打开真实服务连接，并把返回流量作为另一个方向独立发送。
 
-传输 channel 可以是 UDP、TCP、HTTP、DNS、mailbox/file、GitHub upload/download 等。Channel 可以是有向的；`A -> B` 存在不代表 `B -> A` 存在。Relay 和 endpoint 的 channel 集合在进程生命周期内固定；增删或重编号 channel 需要重启相关节点，并同步 entry 的拓扑配置。
+传输 channel 可以是 UDP、TCP、HTTP、DNS、mailbox/file、GitHub upload/download 或其它 shell 能实现的东西。RayNet 通用配置不定义 channel kind。`ChannelId` 只是某个节点本地的 transport handle。
+
+Channel 可以是有向的；`A -> B` 存在不代表 `B -> A` 存在。Entry -> exit 和 exit -> entry 是两个独立方向，可以使用不同 route、不同 MTU 和不同健康状态。
+
+Relay 和 endpoint 的 channel table 在进程生命周期内固定。增删或重编号 channel 需要重启相关节点，并同步相关 endpoint 的 route 配置。
 
 设计文档是架构决策的主要依据。重要设计变化应先写进本文档，再落到代码里。
 
@@ -32,50 +37,48 @@ Runtime Shell
 
 RayNet Core
   sync state machine
-  envelope framing
-  hop authentication
+  opaque transport packet generation/parsing
+  envelope authentication and encryption
   endpoint encryption
   KCP session
-  stream mux
-  channel-plan forwarding
+  route-plan forwarding
   channel health and scheduling
 ```
 
-Core 不直接执行 IO，不读取系统时间，不 spawn task，不 sleep，不访问 socket、文件、环境变量或网络 API。Shell 把外部事件转成 `CoreEvent`，core 推进状态并输出 `CoreAction`，shell 执行动作。
+Core 只推进内存中的协议状态。Shell 把外部事件转成 `CoreEvent`，core 推进状态并输出 `CoreAction`，shell 执行动作。IO、系统时间、task、sleep、socket、文件、环境变量、网络 API 和系统随机源都属于 shell。
 
-## 3. 语言策略
+Core 需要随机性时，只使用构造配置里的 128-bit `RandomSeed` 派生内部 nonce 和随机流。Shell 负责每次启动时生成 seed；测试 shell 可以传固定 seed 获得可复现结果。
 
-Core 必须用 Rust 实现。当前最重要的 shell 也是 Rust shell，主要用于本地开发、Tokio IO、测试和基线实现。
-
-后续可以接入 C、Python、BEAM VM 或其它 runtime shell。跨语言 shell 不重新实现协议逻辑，只调用 Rust core，并负责各自 runtime 下的 IO、timer、process lifecycle、配置和日志。跨语言边界需要单独设计窄接口；在当前阶段，Rust-native API 优先。
-
-## 4. 节点角色
+## 3. 节点角色
 
 ```text
 Entry Endpoint
-  local ingress connection
-  topology view
-  channel plan generation
-  plan health learning
-  endpoint session and KCP
+  ingress connection
+  endpoint session
+  outbound route planning
+  route health learning
 
 Relay
-  envelope authentication
-  channel-plan consumption
-  return-trace recording
+  envelope authentication/decryption
+  route-plan consumption
   local channel forwarding
 
 Exit Endpoint
   exit connection
-  endpoint session and KCP
-  return forwarding
+  endpoint session
+  outbound route planning
+  route health learning
 ```
 
-Entry endpoint 可以持有全网拓扑和调度状态。Relay 和 exit endpoint 不需要全网拓扑；它们只需要自己的本地 channel table、简单目的节点转发表，以及当前 envelope 携带的信息。
+Entry 和 exit 是部署角色。两端都使用 `EndpointCore`。入口侧 shell 负责把本地 ingress 连接转换成 session；出口侧 shell 负责按 `OpenExitConnection` 连接真实服务。入口部署可以禁止执行 `OpenExitConnection`，以隔离 exit 节点被攻破后的反向风险。
 
-## 5. Rust Core API
+Relay 的行为固定为：认证解开 packet，消费 `route_plan[0]`，按指定本地 channel 发出。
+
+## 4. Core API
 
 Rust 版本先使用 Rust-native API。
+
+Core 实现以 Rust 为准。跨语言 shell 不重新实现协议逻辑，只通过 Rust core 的 API/ABI 驱动同一个状态机。
 
 ```text
 EndpointCore::new(config) -> Result<EndpointCore, ConfigError>
@@ -88,36 +91,79 @@ core.next_deadline(now) -> Option<deadline>
 
 `now` 是 shell 传入的虚拟单调时间。Core 不主动查询时间。Shell 在收到外部事件时调用 `handle_event`，在 `next_deadline` 到期时调用 `poll`。`action_sink` 是 core 写入输出动作的临时 sink，Rust 实现可以直接使用 `&mut Vec<CoreAction>`。
 
-## 6. 标识
+Core config 在构造时一次性传入，运行期不通过 event 修改结构性配置。
+
+```text
+EndpointConfig
+  envelope_key
+  message_key
+  random_seed: [u8; 16]
+  local_channels: Vec<ChannelId>
+  route_topology: RouteTopology
+  transport_mtu
+
+RelayConfig
+  envelope_key
+  random_seed: [u8; 16]
+  local_channels: Vec<ChannelId>
+```
+
+当前密钥模型只区分两类 key：
+
+```text
+envelope_key
+  用于 envelope 认证加密
+  EndpointCore 和 RelayCore 都持有
+
+message_key
+  用于 endpoint payload 端到端认证加密
+  只有 EndpointCore 持有
+```
+
+Endpoint config 传入本 endpoint 发送方向可见的 `RouteTopology`。`RouteTopology` 是一张有向图，节点用 `NodeId` 表示，边用各节点本地的 `ChannelId` 表示。Core 根据这份方向拓扑生成或选择实际 `RoutePlan`。
+
+```text
+RouteTopology
+  nodes:
+    node_id
+    channels:
+      channel_id
+      peer_node_id
+```
+
+`RouteTopology` 的起点是本 endpoint，终点是这张方向拓扑汇向的 endpoint。拓扑应收敛到一个明确终点。
+
+`RoutePlan` 是 `Vec<ChannelId>`，由 endpoint core 从 `RouteTopology` 生成。一个 plan 只描述某个 packet 当前方向要走的本地 channel 序列。
+
+## 5. 标识
 
 ```text
 NodeId
-  节点身份，标识 entry、relay、exit
+  节点身份
+  用于配置、结构化事件、测试和 endpoint 可见的有向拓扑图
 
 ChannelId
   某个节点本地的 transport channel 编号
-  在 channel plan 和 return trace 中按当前节点的本地语义解释
+  在 route plan 中按当前节点的本地语义解释
 
-EndpointId
-  endpoint session 双方身份
-
-StreamId
-  endpoint session 内的协议 stream 编号
-  由 core 分配，进入 EndpointFrame
+SessionId
+  endpoint session 编号
+  一个 session 对应一条被代理的本地连接
+  由发起侧 core 分配
 
 LocalConnectionId
   endpoint shell 本地连接句柄
-  只存在于 entry/exit endpoint，不进入 wire protocol
+  只存在于 entry/exit endpoint
 
 Target
   exit endpoint 要连接的目标描述
 ```
 
-`LocalConnectionId` 只用于 endpoint。它对应 entry 侧 ingress connection 或 exit 侧真实服务连接。Relay 不使用 `LocalConnectionId`。
+`LocalConnectionId` 对应 entry 侧 ingress connection 或 exit 侧真实服务连接。Relay 不使用 `LocalConnectionId`。
 
-`StreamId` 是协议里的 logical stream id。Entry 和 exit 用它在 endpoint session 内对应同一条逻辑流。Shell 可以把 `StreamId` 当 opaque token 回传给 core，但不生成或解释它。
+`SessionId` 是协议里的 KCP session id。Entry 和 exit 用它对应同一条被代理连接。Shell 可以把 `SessionId` 当 opaque token 回传给 core，但不生成或解释它。
 
-## 7. CoreEvent
+## 6. CoreEvent
 
 ```text
 CoreEvent
@@ -136,11 +182,11 @@ CoreEvent
     metadata
   }
   ExitConnectionOpened {
-    stream_id,
+    session_id,
     local_connection_id
   }
   ExitConnectionOpenFailed {
-    stream_id,
+    session_id,
     reason
   }
   LocalConnectionBytes {
@@ -151,12 +197,13 @@ CoreEvent
     local_connection_id,
     reason
   }
-  ConfigUpdated(config_delta)
 ```
 
-Connection 相关事件只用于 endpoint core。Relay core 只处理 transport、channel、config 和 timer 推进。
+Connection 相关事件只用于 `EndpointCore`。`RelayCore` 只处理 transport packet、channel 状态和 timer 推进。
 
-## 8. CoreAction
+`TransportChannelUpdated` 对 endpoint 有调度价值：endpoint 可以根据本地发送失败、队列压力和 KCP timeout 调整自己发送方向的 route plan。Relay 不利用它重路由；relay 发送失败等价于丢包，由 endpoint 的 KCP 重传恢复。
+
+## 7. CoreAction
 
 ```text
 CoreAction
@@ -165,7 +212,7 @@ CoreAction
     bytes
   }
   OpenExitConnection {
-    stream_id,
+    session_id,
     target,
     metadata
   }
@@ -177,112 +224,96 @@ CoreAction
     local_connection_id,
     reason
   }
-  CloseRemoteStream {
-    stream_id,
-    reason
-  }
   EmitMetric(metric)
-  EmitLog(level, event)
+  EmitEvent(event)
 ```
 
-Shell 执行 `SendTransportPacket` 时必须使用 core 指定的 `channel_id`。发送失败、队列压力或 channel 断开通过后续 `TransportChannelUpdated` 反馈给 core。
+Shell 执行 `SendTransportPacket` 时必须使用 core 指定的 `channel_id`。Shell 不解释 `bytes`，只把它当 opaque bytes 发给指定 channel。
 
-## 9. Wire Protocol
+Core 输出结构化 event。Shell 负责 event 的呈现、聚合、指标转换和 trace 接入。
+
+## 8. Wire Protocol
 
 ```text
 TransportPacket
-  shell 收发的原始字节
+  shell 收发的 opaque bytes
+  外部观察者不应看到 magic、明文版本、明文 profile、明文类型、明文长度字段或固定协议标记
 
 Envelope
-  relay 可读的节点间转发单元
+  envelope 认证解开后的节点间转发单元
 
 EndpointPayload
   endpoint 间端到端加密和认证的数据
 
-EndpointFrame
-  KCP reassembly 后的 stream mux frame
+SessionFrame
+  KCP reassembly 后的单连接 frame
 ```
 
-Envelope 包含：
+`TransportPacket` 是 core 输出给 shell 的实际发送字节。外层格式不使用 magic number、明文版本、明文 profile、明文 packet type、明文长度字段或其它固定协议标记。接收方只能用配置中的 `envelope_key` 尝试认证解密；失败就丢弃。
+
+认证材料、nonce、tag、padding 和 ciphertext 在外观上应尽量接近随机字节，不暴露可稳定匹配的 RayNet 特征。外层 packet 可以加入随机长度 padding；padding 长度不以明文字段暴露。
+
+认证解开后的内部结构可以使用明确长度字段和 payload。可变长字段必须先验证长度再分配；整数、长度、时间和索引字段必须定义字节序、单位、溢出行为和非法值处理。
+
+Envelope 解开后包含：
 
 ```text
 Envelope
-  magic/version/profile
-  packet_type
-  source_node_id
-  destination_node_id
-  channel_plan
-  return_trace
-  nonce
-  auth_tag
+  route_plan
   payload
 ```
 
-`packet_type` 当前为：
+Relay 只读取 `route_plan`。`payload` 对 relay 是 opaque bytes。
+
+Endpoint payload 解密后包含：
 
 ```text
-PacketType
-  Data
-  Control
+EndpointPayload
+  session_id
+  kcp_segment
 ```
 
-Envelope payload 通常承载某个 endpoint session 的 KCP segment。KCP 负责可靠传输、序列号、重传和乱序处理。KCP reassembly 后，EndpointCore 再解析 `EndpointFrame`：
+KCP reassembly 后，endpoint 解析 `SessionFrame`：
 
 ```text
-EndpointFrame
-  stream_id
+SessionFrame
   frame_type
   length
   payload
 
 FrameType
-  OpenStream
-  StreamBytes
-  CloseStream
-  ResetStream
+  OpenConnection { target, metadata }
+  ConnectionBytes { bytes }
+  CloseConnection { reason }
+  ResetConnection { reason }
   KeepAlive
 ```
 
-Hop-level auth 防止外部伪造或篡改 envelope。当前威胁模型信任已认证 relay，不把 relay compromise 作为主要防御目标。Endpoint-level encryption/auth 保护 endpoint payload，relay 不持有 endpoint payload 的解密能力。
+Envelope auth 使用认证加密保护 envelope，防止外部伪造或篡改。Message encryption/auth 保护 endpoint payload，relay 不持有 endpoint payload 的解密能力。
 
-数据格式使用固定 header、明确长度字段和 payload。Packet/envelope 有最大接收长度；可变长字段先验证长度再分配；整数、长度、时间和索引字段定义字节序、单位、溢出行为和非法值处理。
+当前威胁模型信任已认证 relay，不把 relay compromise 作为主要防御目标。Relay 可能看到 route plan，但看不到 endpoint payload。
 
-## 10. KCP 与 Stream
+## 9. KCP 与 Session
 
-KCP 运行在 logical endpoint session 之间，作为端到端可靠传输机制，不绑定单个 link 或 channel。Relay 只转发 envelope，不理解 KCP segment、stream id、exit target 或 endpoint payload。
+KCP 运行在 logical endpoint session 之间，作为端到端可靠传输机制，不绑定单个 link 或 channel。Relay 只转发 envelope，不理解 KCP segment、session id、exit target 或 endpoint payload。
 
-Channel plan 决定某个 envelope 怎么穿过 relay 网络；KCP 决定 endpoint session 内如何可靠传输。调度器可以把同一个 endpoint session 的不同 KCP segment 放进不同 envelope，经由不同 channel plan 发出。KCP 的重传、ACK、乱序处理和拥塞相关状态属于 endpoint core，不属于 relay。
+一个 ingress TCP connection 对应一个 endpoint session，也对应一个 KCP session。Shell 可以在 ingress/exit connector 层把多条本地连接复用成一条逻辑连接；core 看到的仍然是一条 session。
 
-`EndpointFrame` 位于 KCP reassembly 之后，只做 stream mux，不重复定义可靠传输序列语义。
+一个 `EndpointCore` 可以同时维护多个 endpoint session。每个 session 独立持有 KCP 状态、重传队列和本地连接映射。收到已认证 endpoint payload 后，如果 `session_id` 尚不存在，core 可以按该 session 的第一批 KCP segment 创建对应 session 状态。
 
-## 11. Channel 配置
+`SessionFrame` 位于 KCP reassembly 之后，只表达这条连接的 open、bytes、close、reset 和 keepalive，不重复定义可靠传输序列语义。
 
-每个节点启动时加载固定 channel table：
+EndpointCore 必须知道自己发送方向的 `transport_mtu`，因为 KCP 要用 MTU/MSS 决定 segment 大小。Shell 不负责对 KCP segment 做可靠分片重组。如果 core 输出超大 transport packet，再由 shell 在外层随意拆分，任一外层分片丢失都会让接收端无法恢复该 KCP segment。
 
-```text
-ChannelConfig
-  channel_id
-  peer_node_id
-  channel_kind
-  mtu
-```
+Entry -> exit 和 exit -> entry 可以使用不同的 transport MTU。每个 endpoint 只关心自己发送方向的 MTU；对端回程使用对端自己的 MTU 配置。
 
-`ChannelId` 只在所属节点的命名空间内有意义。Entry 的拓扑配置可以引用其它节点的本地 `ChannelId`，因为 entry 是当前系统的 plan controller。Relay 和 exit 不需要理解其它节点的 `ChannelId`。
+## 10. Channel 与 RoutePlan
 
-运行期只更新 channel 状态：
+每个节点启动时加载固定本地 channel table，也就是本节点可发送的 `ChannelId` 集合。`ChannelId` 只在所属节点的命名空间内有意义。真实 transport 目标由 shell 的 channel 实现管理。
 
-```text
-TransportChannelUpdated
-  channel_id
-  state: Up | Down | Degraded
-  metrics:
-    queue_pressure
-    send_error
-```
+Endpoint 的 `RouteTopology` 可以引用路径上其它节点的本地 `ChannelId`，因为发送 endpoint 负责生成该方向的完整 plan。
 
-## 12. 正向 ChannelPlan
-
-Entry endpoint 为正向包生成 channel plan。一个完整 plan 是一串“各节点本地要使用的 ChannelId”：
+发送方 endpoint 为 outbound envelope 生成单向 route plan。一个完整 plan 是一串“各节点本地要使用的 ChannelId”：
 
 ```text
 FullPlan = [Entry_ch5, RelayA_ch3, RelayB_ch7, RelayC_ch2]
@@ -292,85 +323,87 @@ FullPlan = [Entry_ch5, RelayA_ch3, RelayB_ch7, RelayC_ch2]
 
 ```text
 Entry consumes Entry_ch5
-Envelope.channel_plan = [RelayA_ch3, RelayB_ch7, RelayC_ch2]
+Envelope.route_plan = [RelayA_ch3, RelayB_ch7, RelayC_ch2]
 SendTransportPacket { channel_id: Entry_ch5, bytes }
 
 RelayA consumes RelayA_ch3
-Envelope.channel_plan = [RelayB_ch7, RelayC_ch2]
+Envelope.route_plan = [RelayB_ch7, RelayC_ch2]
 SendTransportPacket { channel_id: RelayA_ch3, bytes }
 
 RelayB consumes RelayB_ch7
-Envelope.channel_plan = [RelayC_ch2]
+Envelope.route_plan = [RelayC_ch2]
 SendTransportPacket { channel_id: RelayB_ch7, bytes }
 
 RelayC consumes RelayC_ch2
-Envelope.channel_plan = []
+Envelope.route_plan = []
 SendTransportPacket { channel_id: RelayC_ch2, bytes }
 ```
 
-Exit endpoint 收到 `destination_node_id == self` 且 `channel_plan` 为空的 envelope 后，把 payload 交给 `EndpointCore`。
+接收 endpoint 收到 `route_plan` 为空的 envelope 后，把 payload 交给 endpoint session。
 
-如果 relay 发现 plan 中指定的本地 channel 不可用，它不尝试全局重路由。它丢弃该 packet 或发送 control failure；entry 通过 failure、timeout 和 session metric 重新选择 plan。这样实现保持简单，自适应逻辑集中在 entry。
+Relay 的正常转发规则只有一种：`route_plan` 非空时，消费第一项作为本地 outbound `ChannelId`，把剩余 plan 写回 envelope 并发送。
 
-## 13. 回包 ReturnTrace
+已知 channel 的真实发送失败由 shell 记录并通过后续事件反馈；对当前 packet 来说它就是丢包。
 
-Exit 到 entry 的回包不要求 exit 知道全网拓扑。Exit 和 relay 只使用本地目的节点转发表：
+Relay 只维护本地 channel table 和必要的结构化事件。
 
-```text
-DestinationForwardingTable
-  destination_node_id -> candidate local ChannelId list
-```
+## 11. 调度与 MTU
 
-回包 envelope 携带 return trace：
+当前调度目标是简单可靠地绕开坏 channel。Endpoint 不维护每条完整 route 的 score；route 数量可能随拓扑指数级增长，按完整 route 记分会让状态膨胀。
 
-```text
-ReturnTrace
-  ordered TraceEntry list
+Endpoint 在 `RouteTopology` 的边上维护运行时状态，并根据这些边状态生成 `RoutePlan`。某条 route 失败时，失败信号可以回写到该 route 经过的边；后续恢复信号可以逐步恢复相关边的状态。
 
-TraceEntry
-  node_id
-  channel_id
-  optional metrics snapshot
-```
-
-Exit 发送回包时，为 `destination_node_id = entry` 选择本地 outbound channel，并写入第一条 trace。每个 relay 转发回包时按目的节点选择本地 channel，追加 trace，再转发。Entry 收到回包后用 trace 学习实际返回路径。
-
-这个模型支持有向 channel。正向 plan 和返回 trace 可以完全不同，只要求 endpoint session 在端到端层面具备双向流量能力。
-
-## 14. 调度与自适应
-
-当前调度目标是简单可靠地绕开坏节点和坏 channel。
-
-Entry endpoint 维护：
+第一版调度可以使用简单的 loss-based edge state。每条 topology 边附带少量运行时字段：
 
 ```text
-PlanScore
-  full channel plan
-  delivery success
-  retransmit rate
-  goodput
-  composite latency
-  stall count
-
-ReturnTraceScore
-  observed return trace
-  delivery success
-  composite latency
-  channel failures
-  queue pressure
-
-NodeHealth
-  alive/degraded/down
-  recent failures
+loss_ewma
+probe_budget
+last_update
 ```
 
-Entry 根据配置拓扑生成候选 plan，避开已知 down/degraded 的节点和 channel。KCP 重传、control failure、send error、timeout、return trace 和 session 表现都会更新 score。调度算法可以很简单：优先使用健康 plan；失败后降权；连续失败后避开相关节点/channel；健康恢复后再逐步试探。
+`loss_ewma` 是这条边的近期丢包/失败估计。`probe_budget` 用于让已经降权的边偶尔被低频探测，避免 channel 恢复后永远不用。`last_update` 使用虚拟单调时间，用于状态衰减和探测节奏。
 
-Relay 和 exit 只做本地选择：从目的节点转发表中挑一个健康 channel。它们不维护全网 score，也不把全网拓扑暴露给服务点。
+Endpoint 生成 `RoutePlan` 时，不枚举所有 route；它在 `RouteTopology` 上按边成本求一条低成本路径。第一版成本函数可以很简单：
 
-MTU 属于 channel 配置。Entry 生成 plan 时使用保守全局 MTU 或 plan 中 channel 的最小 MTU，避免 envelope 超出任一 hop 的承载能力。
+```text
+edge_cost = base + loss_weight * loss_ewma + down_penalty
+route_cost = sum(edge_cost)
+```
 
-## 15. Time 与 Poll
+`down_penalty` 只表达本地已知 channel down 或连续硬失败。没有 hard down 时，主要由 `loss_ewma` 决定选路。
+
+发送失败、KCP timeout 或重传压力上升时，把该 packet 经过的边的 `loss_ewma` 往上推。成功 ACK、稳定发送完成或探测成功时，把相关边的 `loss_ewma` 往下拉。更新方式使用 EWMA，避免单次波动立刻改变全局选择：
+
+```text
+on_failure: loss_ewma = loss_ewma * (1 - alpha) + alpha
+on_success: loss_ewma = loss_ewma * (1 - beta)
+```
+
+`alpha` 可以大于 `beta`，让坏 channel 被更快避开，恢复则更慢进入主路径。
+
+如果某条边连续失败，`loss_ewma` 会快速接近高值，route generation 会自然避开包含该边的路径。如果 channel 恢复，低频 probe 成功后会逐步降低 `loss_ewma`，让该边重新参与正常选路。
+
+后续 route generation 和 edge-state 更新算法仍需要单独调研。目标是：
+
+1. channel 突然断开或质量明显变差时，能较快避开相关边。
+2. channel 恢复后，能通过低风险探测逐步重新使用。
+3. 状态量随 topology 边数增长，不随 route 数量爆炸。
+4. 后续可以从 KCP、send error、queue pressure 等处增加更多信号，但第一版只以 loss EWMA 为主。
+5. 后续评估 EWMA、AIMD、multi-armed bandit、BBR 类估计等思路。
+
+Relay 只执行 envelope 中 `route_plan` 的第一项指令。
+
+MTU 是 endpoint core config 中发送方向的 transport MTU。Endpoint 用它配置 KCP MSS，并预留外层认证和最大 padding 的开销，避免 `SendTransportPacket.bytes` 超过 shell 承诺的承载上限。
+
+最大接收包长是资源保护上限。当前使用编译期常量：
+
+```text
+MAX_TRANSPORT_PACKET_SIZE = 64 KiB
+```
+
+relay 和 endpoint 收到超过该上限的 transport packet，在认证和分配大缓冲前直接丢弃。
+
+## 12. Time、Nonce 与 Replay
 
 ```text
 handle_event(now, ...)
@@ -387,71 +420,71 @@ next_deadline(now)
 
 Core 不 sleep，不 spawn，不设置系统 timer。Shell 可以把 `next_deadline` 映射到 Tokio timer、测试虚拟时间或离线批处理节奏。
 
-## 16. Panic 与安全
+Envelope auth、nonce filter、replay 窗口和 KCP timer 都使用 shell 传入的同一个虚拟单调时间。
+
+Nonce filter 是内存型短期 replay protection。窗口内重复 nonce 会被拒绝；窗口外 replay 依赖 envelope auth 的时间关联失败。
+
+## 13. Panic 与安全
 
 输入边界：
 
-1. 来自网络、配置或 shell 的数据都视为不可信输入。
-2. 未认证输入只能触发廉价解析、认证尝试、丢弃或聚合 metric，不能创建 session、stream、topology、channel-plan state 或重传队列。
-3. 非法版本、认证失败、长度越界、枚举非法、重放、乱序或格式错误不能依赖 panic 处理。
-4. 可变长字段先验证长度再分配。
+1. `TransportPacketReceived.bytes` 是网络进入 core 的不可信输入。
+2. 未认证 transport bytes 只能触发廉价解析、认证尝试、丢弃或聚合 metric，不能创建 session、topology、route-plan state 或重传队列。
+3. 网络包的认证失败、长度越界、枚举非法、重放、乱序或格式错误不能依赖 panic 处理。
+4. 网络包里的可变长字段先验证长度再分配。
 
 Panic 原则：
 
 1. Panic 用来暴露实现 bug 和保留现场，不是输入校验机制。
-2. Core 内部可以用 `assert`、`expect` 表达已经由类型、构造函数或前置校验保证的不变量。
-3. 如果内部状态自相矛盾、进入理论不可达状态，或继续运行可能污染状态，panic 是合适的。
+2. 构造函数、认证、解密和基础长度校验完成后，core 可以按设计不变量已经成立来实现，不需要在每个内部步骤重复做防御性检查。
+3. Core 内部可以用 `assert`、`expect` 表达已经由类型、构造函数或前置校验保证的不变量。
 4. Core 不主动调用 `process::exit` 或主动 abort；但在 `panic = "abort"` 构建配置下，panic 会终止进程，这是部署策略的一部分。
 
 Core 不实现复杂全局资源配额。设计假设攻击者不知道 PSK 或私钥；资源防护放在认证前廉价筛选、认证失败不建状态、解析前长度检查和自然 backpressure 上。
 
-## 17. 简洁性与兼容性
+## 14. 简洁性与兼容性
 
 RayNet 不承诺历史兼容性。系统部署模型假设所有节点可以一起升级。
 
-1. 协议格式、配置格式、profile 和算法可以破坏性调整。
-2. 节点遇到不匹配版本、profile、密码套件或能力集合时直接拒绝。
-3. 主线不保留 legacy adapter、兼容分支、迁移 shim 或旧行为开关。
-4. 能删除的代码优先删除；能用统一状态机表达的逻辑，不拆成隐式协作的后台 task。
-5. 不为尚未真实存在的需求预留复杂扩展点。
+1. 协议格式、配置格式和算法可以破坏性调整。
+2. 来自网络的 packet 如果格式、密钥、密码套件或能力不匹配，直接丢弃。
+3. 已进入 core 内部状态的不变量不做层层兼容校验；预期不可能发生的状态按实现 bug 处理。
+4. 主线不保留 legacy adapter、兼容分支、迁移 shim 或旧行为开关。
+5. 能删除的代码优先删除；能用统一状态机表达的逻辑，不拆成隐式协作的后台 task。
+6. 不为尚未真实存在的需求预留复杂扩展点。
 
-## 18. 长期方向
+## 15. 当前连接模型
+
+Entry endpoint：
+
+```text
+ingress connector <-> EndpointCore
+EndpointCore -> route plan -> transport channel -> EndpointCore
+```
+
+Exit endpoint：
+
+```text
+EndpointCore <-> exit connector
+EndpointCore -> route plan -> transport channel -> EndpointCore
+```
+
+Relay：
+
+```text
+ingress transport -> RelayCore -> egress transport
+```
+
+入口可以由 socks5、HTTP CONNECT、透明代理或平台特定 ingress 提供目标信息；entry core 不绑定具体 ingress 语义。Exit 当前优先支持 TCP connect；后续可以加入 UDP associate 或其它 connector。
+
+## 16. 长期方向
 
 长期方向包括：
 
 1. `no_std + alloc`，让 core 能进入更受限的嵌入环境。
 2. 更窄、更稳定的 C ABI，用于 C、Python、BEAM VM 等 shell。
 3. 更多 transport channel，包括更适合高延迟批量信道的 mailbox/file、HTTP polling、GitHub upload/download 等。
-4. 更丰富的 channel-plan 评分和调度策略，但不牺牲当前 core/shell 边界。
-5. 面向不同网络形态的可靠传输 profile，例如低延迟交互、批量高延迟传输、弱连接恢复等。
+4. 更成熟的 edge-state 和 route generation 策略，但不牺牲当前 core/shell 边界。
+5. 面向不同网络形态的可靠传输参数，例如低延迟交互、批量高延迟传输、弱连接恢复等。
 
-这些方向不改变当前核心边界：core 是同步状态机，shell 负责运行时和 IO，relay 不理解 endpoint payload，entry 负责全局 channel-plan 调度。
-
-## 19. 当前连接模型
-
-Entry endpoint：
-
-```text
-ingress connector
-  -> EndpointCore
-  -> channel plan
-  -> transport channel
-```
-
-Exit endpoint：
-
-```text
-transport channel
-  -> EndpointCore
-  -> exit connector
-```
-
-Relay：
-
-```text
-ingress transport
-  -> RelayCore
-  -> egress transport
-```
-
-入口当前支持 socks5，但 entry 不绑定 socks5 语义；后续可以加入 HTTP CONNECT、透明代理或平台特定 ingress。Exit 当前优先支持 TCP connect；后续可以加入 UDP associate 或其它 connector。
+这些方向不改变当前核心边界：core 是同步状态机，shell 负责运行时和 IO，relay 不理解 endpoint payload，endpoint 负责自己发送方向的 route-plan 调度。

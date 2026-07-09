@@ -1,0 +1,7 @@
+[package]
+name = "raynet-test-shell"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+raynet-core = { path = "../raynet-core" }

@@ -8,9 +8,6 @@ fastack-conserve = []
 
 [dependencies]
 aegis.workspace = true
-arc-swap.workspace = true
-atomic_float.workspace = true
-bitcode.workspace = true
 bytes.workspace = true
 fastbloom.workspace = true
 log.workspace = true

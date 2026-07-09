@@ -2,6 +2,7 @@ use fastbloom::BloomFilter;
 use std::hash::Hash;
 
 /// Nonce replay protection with in-place rotation instead of runtime tasks.
+#[derive(Debug)]
 pub struct NonceFilter {
     current: BloomFilter,
     previous: BloomFilter,

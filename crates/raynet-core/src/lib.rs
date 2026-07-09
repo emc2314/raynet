@@ -6,6 +6,10 @@ pub mod routing;
 pub mod utils;
 
 pub use core::{
-    DataPacket, NonceFilter, RayPacket, RayPacketError, RayPacketType, TCPPacket,
-    apply_stat_update, build_stat_response,
+    ChannelConfig, ChannelId, ChannelState, CloseReason, ConfigDelta, ConfigError, CoreAction,
+    CoreError, CoreEvent, DestinationRoute, EndpointConfig, EndpointCore, EndpointFrame,
+    EndpointId, Envelope, HopPacketError, LocalConnectionId, LogLevel, Metadata, Metric, NodeId,
+    NonceFilter, OpenFailureReason, PacketType, RelayConfig, RelayCore, StreamId, Target,
+    TraceEntry, TransportMetrics, WireError, open_hop_payload, seal_hop_payload,
 };
+pub use routing::{ChannelRouteState, ChannelRouter};

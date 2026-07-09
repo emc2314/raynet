@@ -8,18 +8,18 @@ use std::sync::Arc;
 use std::{fs, io};
 use tokio::net::UdpSocket;
 
-mod adapters;
+mod channels;
 mod connections;
 mod endpoint;
 mod local;
 mod relay;
 mod remote;
-mod rkcp;
+mod transport;
 mod utils;
 
-use raynet_core::routing::Nodes;
-use remote::stat_request;
-use utils::now_millis;
+use channels::UdpChannels;
+use raynet_core::ChannelRouter;
+use tokio::sync::Mutex;
 
 use mimalloc::MiMalloc;
 #[global_allocator]
@@ -76,12 +76,12 @@ async fn main() -> io::Result<()> {
         .expect("Unable to resolve listen address")
         .next()
         .unwrap();
-    let nodes = Arc::new(Nodes::new(
+    let channels = Arc::new(UdpChannels::from_names(
         cli.send
             .or(file_config.send)
             .unwrap_or_else(|| vec!["[::1]:8443".to_string()]),
-        now_millis(),
     ));
+    let router = Arc::new(Mutex::new(ChannelRouter::new(channels.channel_ids())));
     let key = blake3::derive_key(
         "RayNet PSK v1",
         cli.key
@@ -94,19 +94,11 @@ async fn main() -> io::Result<()> {
 
     let udp_socket = Arc::new(UdpSocket::bind(listen_addr).await?);
 
-    {
-        let nodes = nodes.clone();
-        let udp_socket = udp_socket.clone();
-        tokio::spawn(async move {
-            stat_request(nodes, &key, udp_socket).await;
-        });
-    }
-
     let connections = if !endpoint {
-        relay::run(udp_socket, nodes, key).await?;
+        relay::run(udp_socket, channels, router, key).await?;
         None
     } else {
-        Some(endpoint::run(listen_addr, udp_socket, nodes, key).await?)
+        Some(endpoint::run(listen_addr, udp_socket, channels, router, key).await?)
     };
 
     tokio::signal::ctrl_c().await?;
