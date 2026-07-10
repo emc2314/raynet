@@ -8,6 +8,7 @@ fastack-conserve = []
 
 [dependencies]
 aegis.workspace = true
+blake3.workspace = true
 bytes.workspace = true
 fastbloom.workspace = true
 log.workspace = true

@@ -2,19 +2,18 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
-use crate::kcp::{Error as KcpError, Kcp};
-use crate::routing::ChannelRouter;
 use aegis::aegis128l::{Aegis128L, Key, Nonce, Tag};
 
+use crate::kcp::{Error as KcpError, KCP_OVERHEAD, Kcp, get_conv};
+use crate::routing::{LocalChannelTable, RoutePlanner, RouteTopology};
+
 use super::nonce::NonceFilter;
-use super::packet::{HopPacketError, open_hop_payload, seal_hop_payload};
-use super::wire::{EndpointFrame, Envelope, PacketType, TraceEntry, WireError};
+use super::packet::{HopPacketError, RandomStream, open_hop_payload, seal_hop_payload};
+use super::wire::{Envelope, RoutePlan, SessionFrame, WireError};
 
 pub type NodeId = u64;
 pub type ChannelId = u64;
-pub type EndpointId = u64;
-pub type StreamId = u64;
-pub type LocalConnectionId = u64;
+pub type ConvId = u64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
@@ -25,40 +24,23 @@ pub struct Target {
 pub type Metadata = BTreeMap<String, String>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChannelConfig {
-    pub channel_id: ChannelId,
-    pub peer_node_id: NodeId,
-    pub mtu: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DestinationRoute {
-    pub destination_node_id: NodeId,
-    pub channel_ids: Vec<ChannelId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointConfig {
-    pub node_id: NodeId,
-    pub endpoint_id: EndpointId,
-    pub hop_key: [u8; 16],
-    pub endpoint_key: [u8; 16],
-    pub default_destination_node_id: NodeId,
-    pub default_channel_plan: Vec<ChannelId>,
-    pub destination_routes: Vec<DestinationRoute>,
-    pub channels: Vec<ChannelConfig>,
+    pub local_node_id: NodeId,
+    pub envelope_key: [u8; 16],
+    pub message_key: [u8; 16],
+    pub random_seed: [u8; 16],
+    pub local_channels: Vec<ChannelId>,
+    pub route_topology: RouteTopology,
+    pub transport_mtu: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayConfig {
-    pub node_id: NodeId,
-    pub hop_key: [u8; 16],
-    pub destination_routes: Vec<DestinationRoute>,
-    pub channels: Vec<ChannelConfig>,
+    pub local_node_id: NodeId,
+    pub envelope_key: [u8; 16],
+    pub random_seed: [u8; 16],
+    pub local_channels: Vec<ChannelId>,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ConfigDelta;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelState {
@@ -89,15 +71,6 @@ pub enum OpenFailureReason {
     Error(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogLevel {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum Metric {
     TransportChannelUpdated {
@@ -105,12 +78,18 @@ pub enum Metric {
         state: ChannelState,
         metrics: TransportMetrics,
     },
-    LocalConnectionOpened {
-        local_connection_id: LocalConnectionId,
+    IngressSessionCreated {
+        conv_id: ConvId,
     },
-    LocalConnectionClosed {
-        local_connection_id: LocalConnectionId,
+    SessionClosed {
+        conv_id: ConvId,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoreStructuredEvent {
+    IngressSessionCreated { conv_id: ConvId },
+    SessionClosed { conv_id: ConvId },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,28 +103,25 @@ pub enum CoreEvent {
         state: ChannelState,
         metrics: TransportMetrics,
     },
-    IngressConnectionOpened {
-        local_connection_id: LocalConnectionId,
+    IngressSessionRequested {
         target: Target,
         metadata: Metadata,
     },
     ExitConnectionOpened {
-        stream_id: StreamId,
-        local_connection_id: LocalConnectionId,
+        conv_id: ConvId,
     },
     ExitConnectionOpenFailed {
-        stream_id: StreamId,
+        conv_id: ConvId,
         reason: OpenFailureReason,
     },
-    LocalConnectionBytes {
-        local_connection_id: LocalConnectionId,
+    SessionBytes {
+        conv_id: ConvId,
         bytes: Vec<u8>,
     },
-    LocalConnectionClosed {
-        local_connection_id: LocalConnectionId,
+    SessionClosed {
+        conv_id: ConvId,
         reason: CloseReason,
     },
-    ConfigUpdated(ConfigDelta),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -154,50 +130,44 @@ pub enum CoreAction {
         channel_id: ChannelId,
         bytes: Vec<u8>,
     },
+    IngressSessionCreated {
+        conv_id: ConvId,
+    },
     OpenExitConnection {
-        stream_id: StreamId,
+        conv_id: ConvId,
         target: Target,
         metadata: Metadata,
     },
-    WriteLocalConnection {
-        local_connection_id: LocalConnectionId,
+    WriteSession {
+        conv_id: ConvId,
         bytes: Vec<u8>,
     },
-    CloseLocalConnection {
-        local_connection_id: LocalConnectionId,
-        reason: CloseReason,
-    },
-    CloseRemoteStream {
-        stream_id: StreamId,
+    CloseSession {
+        conv_id: ConvId,
         reason: CloseReason,
     },
     EmitMetric(Metric),
-    EmitLog {
-        level: LogLevel,
-        event: String,
-    },
+    EmitEvent(CoreStructuredEvent),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("node id must be non-zero")]
     EmptyNodeId,
-    #[error("endpoint id must be non-zero")]
-    EmptyEndpointId,
-    #[error("channel {0} has zero MTU")]
-    ZeroMtu(ChannelId),
-    #[error("unknown channel {0}")]
-    UnknownChannel(ChannelId),
+    #[error("transport MTU must be non-zero")]
+    ZeroMtu,
+    #[error("unknown local channel {0}")]
+    UnknownLocalChannel(ChannelId),
+    #[error("route topology has no usable route from local node")]
+    NoRoute,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     #[error("event is not supported by this core role")]
     UnsupportedEvent,
-    #[error("unknown local connection {0}")]
-    UnknownLocalConnection(LocalConnectionId),
-    #[error("unknown stream {0}")]
-    UnknownStream(StreamId),
+    #[error("unknown conv {0}")]
+    UnknownConv(ConvId),
     #[error("no route is available")]
     NoRoute,
     #[error("wire error: {0}")]
@@ -206,45 +176,48 @@ pub enum CoreError {
     HopPacket(#[from] HopPacketError),
     #[error("session error: {0}")]
     Session(#[from] KcpError),
-    #[error("endpoint payload authentication failed")]
-    EndpointPayloadAuthFailed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LocalStream {
-    stream_id: StreamId,
-    local_connection_id: LocalConnectionId,
+    #[error("endpoint message authentication failed")]
+    EndpointMessageAuthFailed,
+    #[error("invalid KCP segment length {0}")]
+    InvalidKcpSegment(usize),
 }
 
 #[derive(Debug)]
 pub struct EndpointCore {
     config: EndpointConfig,
-    router: ChannelRouter,
-    session: EndpointSession,
-    hop_nonce_filter: NonceFilter,
-    next_stream_id: u64,
-    local_streams: BTreeMap<LocalConnectionId, LocalStream>,
-    remote_streams: BTreeMap<StreamId, LocalConnectionId>,
+    local_channels: LocalChannelTable,
+    route_planner: RoutePlanner,
+    envelope_nonce_filter: NonceFilter,
+    envelope_random: RandomStream,
+    message_random: RandomStream,
+    sessions: BTreeMap<ConvId, EndpointSession>,
+    next_conv_id: ConvId,
 }
 
 impl EndpointCore {
     pub fn new(config: EndpointConfig) -> Result<Self, ConfigError> {
         validate_endpoint_config(&config)?;
-        let session_mtu = session_mtu(&config.channels);
+        let local_channels = LocalChannelTable::new(config.local_channels.iter().copied());
+        let route_planner = RoutePlanner::new(config.route_topology.clone());
+
+        if route_planner
+            .build_route_plan(config.local_node_id, &local_channels)
+            .is_none()
+        {
+            return Err(ConfigError::NoRoute);
+        }
+
+        let next_conv_id = initial_conv_id(config.random_seed);
 
         Ok(Self {
-            router: ChannelRouter::from_configs(&config.channels),
-            session: EndpointSession::new(
-                config.node_id,
-                config.endpoint_id,
-                config.endpoint_key,
-                session_mtu,
-            ),
-            hop_nonce_filter: NonceFilter::new(1 << 24, 0.00001, 1 << 16, 0),
+            envelope_nonce_filter: NonceFilter::new(1 << 24, 0.00001, 1 << 16, 0),
+            envelope_random: RandomStream::new(config.random_seed, b"endpoint envelope"),
+            message_random: RandomStream::new(config.random_seed, b"endpoint message"),
             config,
-            next_stream_id: 1,
-            local_streams: BTreeMap::new(),
-            remote_streams: BTreeMap::new(),
+            local_channels,
+            route_planner,
+            sessions: BTreeMap::new(),
+            next_conv_id,
         })
     }
 
@@ -255,97 +228,71 @@ impl EndpointCore {
         actions: &mut Vec<CoreAction>,
     ) -> Result<(), CoreError> {
         match event {
-            CoreEvent::IngressConnectionOpened {
-                local_connection_id,
-                target,
-                metadata,
-            } => {
-                let stream_id = self.allocate_stream_id();
-                self.local_streams.insert(
-                    local_connection_id,
-                    LocalStream {
-                        stream_id,
-                        local_connection_id,
-                    },
-                );
-                self.send_endpoint_frame(
-                    now_ms,
-                    EndpointFrame::OpenStream {
-                        stream_id,
-                        target,
-                        metadata,
-                    },
-                    actions,
-                )?;
-                actions.push(CoreAction::EmitMetric(Metric::LocalConnectionOpened {
-                    local_connection_id,
+            CoreEvent::IngressSessionRequested { target, metadata } => {
+                let conv_id = self.allocate_conv_id();
+                self.ensure_session(conv_id)?;
+                actions.push(CoreAction::IngressSessionCreated { conv_id });
+                actions.push(CoreAction::EmitMetric(Metric::IngressSessionCreated {
+                    conv_id,
                 }));
-                Ok(())
-            }
-            CoreEvent::ExitConnectionOpened {
-                stream_id,
-                local_connection_id,
-            } => {
-                self.remote_streams.insert(stream_id, local_connection_id);
-                Ok(())
-            }
-            CoreEvent::LocalConnectionBytes {
-                local_connection_id,
-                bytes,
-            } => {
-                let stream_id = self
-                    .stream_for_local_connection(local_connection_id)
-                    .ok_or(CoreError::UnknownLocalConnection(local_connection_id))?;
-                self.send_endpoint_frame(
+                actions.push(CoreAction::EmitEvent(
+                    CoreStructuredEvent::IngressSessionCreated { conv_id },
+                ));
+                self.send_session_frame(
                     now_ms,
-                    EndpointFrame::StreamBytes { stream_id, bytes },
+                    conv_id,
+                    SessionFrame::OpenConnection { target, metadata },
                     actions,
                 )
             }
-            CoreEvent::LocalConnectionClosed {
-                local_connection_id,
-                reason,
-            } => {
-                if let Some(stream) = self.local_streams.remove(&local_connection_id) {
-                    self.send_endpoint_frame(
-                        now_ms,
-                        EndpointFrame::CloseStream {
-                            stream_id: stream.stream_id,
-                            reason,
-                        },
-                        actions,
-                    )?;
-                    actions.push(CoreAction::EmitMetric(Metric::LocalConnectionClosed {
-                        local_connection_id,
-                    }));
-                    return Ok(());
-                }
-
-                if let Some(stream_id) = self
-                    .remote_streams
-                    .iter()
-                    .find_map(|(stream_id, id)| (*id == local_connection_id).then_some(*stream_id))
-                {
-                    self.remote_streams.remove(&stream_id);
-                    self.send_endpoint_frame(
-                        now_ms,
-                        EndpointFrame::CloseStream { stream_id, reason },
-                        actions,
-                    )?;
-                    actions.push(CoreAction::EmitMetric(Metric::LocalConnectionClosed {
-                        local_connection_id,
-                    }));
-                    return Ok(());
-                }
-
-                Err(CoreError::UnknownLocalConnection(local_connection_id))
+            CoreEvent::ExitConnectionOpened { conv_id } => {
+                self.ensure_session(conv_id)?;
+                Ok(())
+            }
+            CoreEvent::ExitConnectionOpenFailed { conv_id, reason } => self.send_session_frame(
+                now_ms,
+                conv_id,
+                SessionFrame::ResetConnection {
+                    reason: CloseReason::Error(format!("{reason:?}")),
+                },
+                actions,
+            ),
+            CoreEvent::SessionBytes { conv_id, bytes } => self.send_session_frame(
+                now_ms,
+                conv_id,
+                SessionFrame::ConnectionBytes { bytes },
+                actions,
+            ),
+            CoreEvent::SessionClosed { conv_id, reason } => {
+                self.send_session_frame(
+                    now_ms,
+                    conv_id,
+                    SessionFrame::CloseConnection {
+                        reason: reason.clone(),
+                    },
+                    actions,
+                )?;
+                self.sessions.remove(&conv_id);
+                actions.push(CoreAction::EmitMetric(Metric::SessionClosed { conv_id }));
+                actions.push(CoreAction::EmitEvent(CoreStructuredEvent::SessionClosed {
+                    conv_id,
+                }));
+                Ok(())
             }
             CoreEvent::TransportChannelUpdated {
                 channel_id,
                 state,
                 metrics,
             } => {
-                self.router.update_channel(channel_id, state, metrics);
+                self.local_channels
+                    .update_channel(channel_id, state, metrics);
+                self.route_planner.update_edge(
+                    self.config.local_node_id,
+                    channel_id,
+                    state,
+                    metrics,
+                    now_ms,
+                );
                 actions.push(CoreAction::EmitMetric(Metric::TransportChannelUpdated {
                     channel_id,
                     state,
@@ -353,82 +300,78 @@ impl EndpointCore {
                 }));
                 Ok(())
             }
-            CoreEvent::ConfigUpdated(_) => Ok(()),
             CoreEvent::TransportPacketReceived { channel_id, bytes } => {
-                self.router.record_receive(channel_id);
+                self.local_channels.record_receive(channel_id);
                 self.handle_transport_packet(now_ms, bytes, actions)
             }
-            CoreEvent::ExitConnectionOpenFailed { stream_id, reason } => self.send_endpoint_frame(
-                now_ms,
-                EndpointFrame::ResetStream {
-                    stream_id,
-                    reason: CloseReason::Error(format!("{reason:?}")),
-                },
-                actions,
-            ),
         }
     }
 
     pub fn poll(&mut self, now_ms: u64, actions: &mut Vec<CoreAction>) -> Result<(), CoreError> {
-        let packets = self.session.poll(now_ms)?;
-        self.send_session_packets(now_ms, packets, actions)
+        let conv_ids: Vec<_> = self.sessions.keys().copied().collect();
+        for conv_id in conv_ids {
+            let packets = self
+                .sessions
+                .get_mut(&conv_id)
+                .expect("conv id collected from sessions")
+                .poll(now_ms)?;
+            self.send_kcp_segments(now_ms, packets, actions)?;
+        }
+        Ok(())
     }
 
     pub fn next_deadline(&self, now_ms: u64) -> Option<u64> {
-        self.session.next_deadline(now_ms)
+        self.sessions
+            .values()
+            .filter_map(|session| session.next_deadline(now_ms))
+            .min()
     }
 
     pub fn channel_count(&self) -> usize {
-        self.config.channels.len()
+        self.local_channels.channel_ids().count()
     }
 
-    fn allocate_stream_id(&mut self) -> StreamId {
-        let stream_id = self.next_stream_id;
-        self.next_stream_id = self.next_stream_id.saturating_add(1).max(1);
-        stream_id
+    fn allocate_conv_id(&mut self) -> ConvId {
+        let conv_id = self.next_conv_id;
+        self.next_conv_id = self.next_conv_id.wrapping_add(1);
+        conv_id
     }
 
-    fn stream_for_local_connection(
-        &self,
-        local_connection_id: LocalConnectionId,
-    ) -> Option<StreamId> {
-        self.local_streams
-            .get(&local_connection_id)
-            .map(|stream| stream.stream_id)
-            .or_else(|| {
-                self.remote_streams
-                    .iter()
-                    .find_map(|(stream_id, id)| (*id == local_connection_id).then_some(*stream_id))
-            })
+    fn ensure_session(&mut self, conv_id: ConvId) -> Result<(), CoreError> {
+        if !self.sessions.contains_key(&conv_id) {
+            self.sessions.insert(
+                conv_id,
+                EndpointSession::new(conv_id, self.config.transport_mtu),
+            );
+        }
+        Ok(())
     }
 
-    fn local_connection_for_stream(&self, stream_id: StreamId) -> Option<LocalConnectionId> {
-        self.local_streams
-            .values()
-            .find_map(|stream| {
-                (stream.stream_id == stream_id).then_some(stream.local_connection_id)
-            })
-            .or_else(|| self.remote_streams.get(&stream_id).copied())
-    }
-
-    fn send_endpoint_frame(
+    fn send_session_frame(
         &mut self,
         now_ms: u64,
-        frame: EndpointFrame,
+        conv_id: ConvId,
+        frame: SessionFrame,
         actions: &mut Vec<CoreAction>,
     ) -> Result<(), CoreError> {
-        let packets = self.session.send_frame(now_ms, frame)?;
-        self.send_session_packets(now_ms, packets, actions)
+        self.ensure_session(conv_id)?;
+        let packets = self
+            .sessions
+            .get_mut(&conv_id)
+            .expect("ensure_session inserted session")
+            .send_frame(now_ms, frame)?;
+        self.send_kcp_segments(now_ms, packets, actions)
     }
 
-    fn send_session_packets(
+    fn send_kcp_segments(
         &mut self,
         now_ms: u64,
         packets: Vec<Vec<u8>>,
         actions: &mut Vec<CoreAction>,
     ) -> Result<(), CoreError> {
         for packet in packets {
-            self.send_envelope_payload(now_ms, packet, actions)?;
+            let payload = self.seal_endpoint_message(packet)?;
+            self.send_envelope_payload(now_ms, payload, actions)?;
         }
         Ok(())
     }
@@ -439,32 +382,36 @@ impl EndpointCore {
         payload: Vec<u8>,
         actions: &mut Vec<CoreAction>,
     ) -> Result<(), CoreError> {
-        let (channel_id, channel_plan) = self.next_outbound_plan()?;
+        let (channel_id, route_plan) = self.next_outbound_plan()?;
         let envelope = Envelope {
-            packet_type: PacketType::Data,
-            source_node_id: self.config.node_id,
-            destination_node_id: self.config.default_destination_node_id,
-            channel_plan,
-            return_trace: Vec::new(),
+            route_plan,
             payload,
         };
         actions.push(CoreAction::SendTransportPacket {
             channel_id,
-            bytes: encode_hop_packet(now_ms, &self.config.hop_key, envelope)?,
+            bytes: encode_hop_packet(
+                now_ms,
+                &self.config.envelope_key,
+                &mut self.envelope_random,
+                envelope,
+            )?,
         });
-        self.router.record_send(channel_id);
+        self.local_channels.record_send(channel_id);
+        self.route_planner
+            .record_success(self.config.local_node_id, channel_id, now_ms);
         Ok(())
     }
 
-    fn next_outbound_plan(&mut self) -> Result<(ChannelId, Vec<ChannelId>), CoreError> {
-        if let Some((first, rest)) = self.config.default_channel_plan.split_first() {
-            if !self.router.is_usable(*first) {
-                return Err(CoreError::NoRoute);
-            }
-            return Ok((*first, rest.to_vec()));
+    fn next_outbound_plan(&self) -> Result<(ChannelId, RoutePlan), CoreError> {
+        let mut route_plan = self
+            .route_planner
+            .build_route_plan(self.config.local_node_id, &self.local_channels)
+            .ok_or(CoreError::NoRoute)?;
+        if route_plan.is_empty() {
+            return Err(CoreError::NoRoute);
         }
-        let channel_id = self.router.select_channel().ok_or(CoreError::NoRoute)?;
-        Ok((channel_id, Vec::new()))
+        let channel_id = route_plan.remove(0);
+        Ok((channel_id, route_plan))
     }
 
     fn handle_transport_packet(
@@ -475,171 +422,159 @@ impl EndpointCore {
     ) -> Result<(), CoreError> {
         let envelope = decode_hop_packet(
             now_ms,
-            &self.config.hop_key,
-            &mut self.hop_nonce_filter,
+            &self.config.envelope_key,
+            &mut self.envelope_nonce_filter,
             &bytes,
         )?;
-        if envelope.destination_node_id != self.config.node_id || !envelope.channel_plan.is_empty()
-        {
-            return self.forward_envelope(now_ms, envelope, actions);
+        if !envelope.route_plan.is_empty() {
+            return Err(CoreError::NoRoute);
         }
 
-        let session_output = self.session.input_packet(now_ms, &envelope.payload)?;
-        self.send_session_packets(now_ms, session_output.packets, actions)?;
+        let kcp_segment = self.open_endpoint_message(&envelope.payload)?;
+        if kcp_segment.len() < KCP_OVERHEAD {
+            return Err(CoreError::InvalidKcpSegment(kcp_segment.len()));
+        }
+        let conv_id = get_conv(&kcp_segment);
+        self.ensure_session(conv_id)?;
+
+        let session_output = self
+            .sessions
+            .get_mut(&conv_id)
+            .expect("ensure_session inserted session")
+            .input_packet(now_ms, &kcp_segment)?;
+        self.send_kcp_segments(now_ms, session_output.packets, actions)?;
 
         for frame in session_output.frames {
-            self.handle_endpoint_frame(frame, actions)?;
+            self.handle_session_frame(conv_id, frame, actions)?;
         }
         Ok(())
     }
 
-    fn handle_endpoint_frame(
+    fn handle_session_frame(
         &mut self,
-        frame: EndpointFrame,
+        conv_id: ConvId,
+        frame: SessionFrame,
         actions: &mut Vec<CoreAction>,
     ) -> Result<(), CoreError> {
         match frame {
-            EndpointFrame::OpenStream {
-                stream_id,
-                target,
-                metadata,
-            } => {
+            SessionFrame::OpenConnection { target, metadata } => {
                 actions.push(CoreAction::OpenExitConnection {
-                    stream_id,
+                    conv_id,
                     target,
                     metadata,
                 });
                 Ok(())
             }
-            EndpointFrame::StreamBytes { stream_id, bytes } => {
-                let local_connection_id = self
-                    .local_connection_for_stream(stream_id)
-                    .ok_or(CoreError::UnknownStream(stream_id))?;
-                actions.push(CoreAction::WriteLocalConnection {
-                    local_connection_id,
-                    bytes,
-                });
+            SessionFrame::ConnectionBytes { bytes } => {
+                actions.push(CoreAction::WriteSession { conv_id, bytes });
                 Ok(())
             }
-            EndpointFrame::CloseStream { stream_id, reason }
-            | EndpointFrame::ResetStream { stream_id, reason } => {
-                let local_connection_id = self
-                    .local_connection_for_stream(stream_id)
-                    .ok_or(CoreError::UnknownStream(stream_id))?;
-                actions.push(CoreAction::CloseLocalConnection {
-                    local_connection_id,
-                    reason,
-                });
+            SessionFrame::CloseConnection { reason } | SessionFrame::ResetConnection { reason } => {
+                self.sessions.remove(&conv_id);
+                actions.push(CoreAction::CloseSession { conv_id, reason });
+                actions.push(CoreAction::EmitMetric(Metric::SessionClosed { conv_id }));
+                actions.push(CoreAction::EmitEvent(CoreStructuredEvent::SessionClosed {
+                    conv_id,
+                }));
                 Ok(())
             }
-            EndpointFrame::KeepAlive => Ok(()),
+            SessionFrame::KeepAlive => Ok(()),
         }
     }
 
-    fn forward_envelope(
-        &mut self,
-        now_ms: u64,
-        mut envelope: Envelope,
-        actions: &mut Vec<CoreAction>,
-    ) -> Result<(), CoreError> {
-        let channel_id = if !envelope.channel_plan.is_empty() {
-            let channel_id = envelope.channel_plan.remove(0);
-            if !self.router.is_usable(channel_id) {
-                return Err(CoreError::NoRoute);
-            }
-            channel_id
-        } else {
-            self.select_channel_for_destination(envelope.destination_node_id)?
-        };
-        envelope.return_trace.push(TraceEntry {
-            node_id: self.config.node_id,
-            channel_id,
-        });
-        actions.push(CoreAction::SendTransportPacket {
-            channel_id,
-            bytes: encode_hop_packet(now_ms, &self.config.hop_key, envelope)?,
-        });
-        self.router.record_send(channel_id);
-        Ok(())
+    fn seal_endpoint_message(&mut self, kcp_segment: Vec<u8>) -> Result<Vec<u8>, CoreError> {
+        let nonce = self.message_random.nonce();
+        let mut plaintext = kcp_segment;
+        let tag: Tag<16> = Aegis128L::new(&self.config.message_key, &nonce)
+            .encrypt_in_place(&mut plaintext, &message_ad());
+        let mut out = Vec::with_capacity(32 + plaintext.len());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&tag);
+        out.extend_from_slice(&plaintext);
+        Ok(out)
     }
 
-    fn select_channel_for_destination(
-        &mut self,
-        destination_node_id: NodeId,
-    ) -> Result<ChannelId, CoreError> {
-        if let Some(route) = self
-            .config
-            .destination_routes
-            .iter()
-            .find(|route| route.destination_node_id == destination_node_id)
-        {
-            return self
-                .router
-                .select_candidate(route.channel_ids.iter().copied())
-                .ok_or(CoreError::NoRoute);
+    fn open_endpoint_message(&self, packet: &[u8]) -> Result<Vec<u8>, CoreError> {
+        if packet.len() < 32 {
+            return Err(CoreError::EndpointMessageAuthFailed);
         }
-        self.router.select_channel().ok_or(CoreError::NoRoute)
+        let nonce: Nonce = packet[0..16]
+            .try_into()
+            .map_err(|_| CoreError::EndpointMessageAuthFailed)?;
+        let tag: Tag<16> = packet[16..32]
+            .try_into()
+            .map_err(|_| CoreError::EndpointMessageAuthFailed)?;
+        Aegis128L::new(&self.config.message_key, &nonce)
+            .decrypt(&packet[32..], &tag, &message_ad())
+            .map_err(|_| CoreError::EndpointMessageAuthFailed)
     }
 }
 
-fn encode_hop_packet(now_ms: u64, hop_key: &Key, envelope: Envelope) -> Result<Vec<u8>, CoreError> {
+fn encode_hop_packet(
+    now_ms: u64,
+    envelope_key: &Key,
+    random: &mut RandomStream,
+    envelope: Envelope,
+) -> Result<Vec<u8>, CoreError> {
     let payload = envelope.encode()?;
-    Ok(seal_hop_payload(now_ms, hop_key, &payload))
+    Ok(seal_hop_payload(
+        now_ms,
+        envelope_key,
+        random.nonce(),
+        &payload,
+    ))
 }
 
 fn decode_hop_packet(
     now_ms: u64,
-    hop_key: &Key,
+    envelope_key: &Key,
     nonce_filter: &mut NonceFilter,
     bytes: &[u8],
 ) -> Result<Envelope, CoreError> {
-    let payload = open_hop_payload(now_ms, hop_key, bytes, nonce_filter)?;
+    let payload = open_hop_payload(now_ms, envelope_key, bytes, nonce_filter)?;
     Envelope::decode(&payload).map_err(CoreError::from)
+}
+
+fn message_ad() -> [u8; 16] {
+    *b"RNMSG1\0\0\0\0\0\0\0\0\0\0"
+}
+
+fn initial_conv_id(seed: [u8; 16]) -> ConvId {
+    let hash = blake3::derive_key("RayNet conv id counter v1", &seed);
+    u64::from_le_bytes(hash[0..8].try_into().expect("eight bytes"))
 }
 
 #[derive(Debug)]
 struct EndpointSession {
     kcp: Kcp<SessionOutputBuffer>,
     output: SessionOutputBuffer,
-    local_node_id: NodeId,
-    endpoint_id: EndpointId,
-    endpoint_key: Key,
-    next_nonce_counter: u64,
 }
 
 #[derive(Debug)]
 struct SessionOutput {
-    frames: Vec<EndpointFrame>,
+    frames: Vec<SessionFrame>,
     packets: Vec<Vec<u8>>,
 }
 
 impl EndpointSession {
-    fn new(local_node_id: NodeId, endpoint_id: EndpointId, endpoint_key: Key, mtu: usize) -> Self {
+    fn new(conv_id: ConvId, transport_mtu: usize) -> Self {
         let output = SessionOutputBuffer::default();
-        let mut kcp = Kcp::new(endpoint_id as u32, output.clone());
-        kcp.set_mtu(mtu)
+        let mut kcp = Kcp::new(conv_id, output.clone());
+        kcp.set_mtu(session_mtu(transport_mtu))
             .expect("session_mtu returns a valid KCP MTU");
         kcp.set_nodelay(true, 20, 2, true);
         kcp.set_wndsize(128, 128);
-        Self {
-            kcp,
-            output,
-            local_node_id,
-            endpoint_id,
-            endpoint_key,
-            next_nonce_counter: 1,
-        }
+        Self { kcp, output }
     }
 
-    fn send_frame(&mut self, now_ms: u64, frame: EndpointFrame) -> Result<Vec<Vec<u8>>, CoreError> {
+    fn send_frame(&mut self, now_ms: u64, frame: SessionFrame) -> Result<Vec<Vec<u8>>, CoreError> {
         let payload = frame.encode()?;
         self.kcp.send(&payload)?;
         self.flush_now(now_ms)
     }
 
     fn input_packet(&mut self, now_ms: u64, packet: &[u8]) -> Result<SessionOutput, CoreError> {
-        let packet = self.decrypt_packet(packet)?;
-        self.kcp.input(&packet)?;
+        self.kcp.input(packet)?;
         let packets = self.flush_now(now_ms)?;
         let frames = self.recv_frames()?;
         Ok(SessionOutput { frames, packets })
@@ -647,13 +582,13 @@ impl EndpointSession {
 
     fn poll(&mut self, now_ms: u64) -> Result<Vec<Vec<u8>>, CoreError> {
         self.kcp.update(now_ms as u32)?;
-        self.encrypt_packets(self.output.take())
+        Ok(self.output.take())
     }
 
     fn flush_now(&mut self, now_ms: u64) -> Result<Vec<Vec<u8>>, CoreError> {
         self.kcp.update(now_ms as u32)?;
         self.kcp.flush()?;
-        self.encrypt_packets(self.output.take())
+        Ok(self.output.take())
     }
 
     fn next_deadline(&self, now_ms: u64) -> Option<u64> {
@@ -663,7 +598,7 @@ impl EndpointSession {
         Some(now_ms.saturating_add(self.kcp.check(now_ms as u32) as u64))
     }
 
-    fn recv_frames(&mut self) -> Result<Vec<EndpointFrame>, CoreError> {
+    fn recv_frames(&mut self) -> Result<Vec<SessionFrame>, CoreError> {
         let mut frames = Vec::new();
         loop {
             let size = match self.kcp.peeksize() {
@@ -674,57 +609,9 @@ impl EndpointSession {
             let mut payload = vec![0; size];
             let read = self.kcp.recv(&mut payload)?;
             payload.truncate(read);
-            frames.push(EndpointFrame::decode(&payload)?);
+            frames.push(SessionFrame::decode(&payload)?);
         }
         Ok(frames)
-    }
-
-    fn encrypt_packets(&mut self, packets: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>, CoreError> {
-        packets
-            .into_iter()
-            .map(|packet| self.encrypt_packet(packet))
-            .collect()
-    }
-
-    fn encrypt_packet(&mut self, mut packet: Vec<u8>) -> Result<Vec<u8>, CoreError> {
-        let nonce = self.next_nonce();
-        let tag: Tag<16> =
-            Aegis128L::new(&self.endpoint_key, &nonce).encrypt_in_place(&mut packet, &self.ad());
-        let mut out = Vec::with_capacity(32 + packet.len());
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&tag);
-        out.extend_from_slice(&packet);
-        Ok(out)
-    }
-
-    fn decrypt_packet(&self, packet: &[u8]) -> Result<Vec<u8>, CoreError> {
-        if packet.len() < 32 {
-            return Err(CoreError::EndpointPayloadAuthFailed);
-        }
-        let nonce: Nonce = packet[0..16]
-            .try_into()
-            .map_err(|_| CoreError::EndpointPayloadAuthFailed)?;
-        let tag: Tag<16> = packet[16..32]
-            .try_into()
-            .map_err(|_| CoreError::EndpointPayloadAuthFailed)?;
-        Aegis128L::new(&self.endpoint_key, &nonce)
-            .decrypt(&packet[32..], &tag, &self.ad())
-            .map_err(|_| CoreError::EndpointPayloadAuthFailed)
-    }
-
-    fn next_nonce(&mut self) -> Nonce {
-        let mut nonce = [0; 16];
-        nonce[0..8].copy_from_slice(&self.local_node_id.to_le_bytes());
-        nonce[8..16].copy_from_slice(&self.next_nonce_counter.to_le_bytes());
-        self.next_nonce_counter = self.next_nonce_counter.saturating_add(1).max(1);
-        nonce
-    }
-
-    fn ad(&self) -> [u8; 16] {
-        let mut ad = [0; 16];
-        ad[0..8].copy_from_slice(&self.endpoint_id.to_le_bytes());
-        ad[8..16].copy_from_slice(b"RNEP1\0\0\0");
-        ad
     }
 }
 
@@ -751,29 +638,25 @@ impl Write for SessionOutputBuffer {
     }
 }
 
-fn session_mtu(channels: &[ChannelConfig]) -> usize {
-    channels
-        .iter()
-        .map(|channel| channel.mtu)
-        .min()
-        .unwrap_or(1200)
-        .saturating_sub(128)
-        .max(50)
+fn session_mtu(transport_mtu: usize) -> usize {
+    transport_mtu.saturating_sub(128).max(50)
 }
 
 #[derive(Debug)]
 pub struct RelayCore {
     config: RelayConfig,
-    router: ChannelRouter,
-    hop_nonce_filter: NonceFilter,
+    local_channels: LocalChannelTable,
+    envelope_nonce_filter: NonceFilter,
+    envelope_random: RandomStream,
 }
 
 impl RelayCore {
     pub fn new(config: RelayConfig) -> Result<Self, ConfigError> {
         validate_relay_config(&config)?;
         Ok(Self {
-            router: ChannelRouter::from_configs(&config.channels),
-            hop_nonce_filter: NonceFilter::new(1 << 24, 0.00001, 1 << 16, 0),
+            local_channels: LocalChannelTable::new(config.local_channels.iter().copied()),
+            envelope_nonce_filter: NonceFilter::new(1 << 24, 0.00001, 1 << 16, 0),
+            envelope_random: RandomStream::new(config.random_seed, b"relay envelope"),
             config,
         })
     }
@@ -786,11 +669,11 @@ impl RelayCore {
     ) -> Result<(), CoreError> {
         match event {
             CoreEvent::TransportPacketReceived { channel_id, bytes } => {
-                self.router.record_receive(channel_id);
+                self.local_channels.record_receive(channel_id);
                 let envelope = decode_hop_packet(
                     now_ms,
-                    &self.config.hop_key,
-                    &mut self.hop_nonce_filter,
+                    &self.config.envelope_key,
+                    &mut self.envelope_nonce_filter,
                     &bytes,
                 )?;
                 self.forward_envelope(now_ms, envelope, actions)
@@ -800,7 +683,8 @@ impl RelayCore {
                 state,
                 metrics,
             } => {
-                self.router.update_channel(channel_id, state, metrics);
+                self.local_channels
+                    .update_channel(channel_id, state, metrics);
                 actions.push(CoreAction::EmitMetric(Metric::TransportChannelUpdated {
                     channel_id,
                     state,
@@ -808,12 +692,11 @@ impl RelayCore {
                 }));
                 Ok(())
             }
-            CoreEvent::ConfigUpdated(_) => Ok(()),
-            CoreEvent::IngressConnectionOpened { .. }
+            CoreEvent::IngressSessionRequested { .. }
             | CoreEvent::ExitConnectionOpened { .. }
             | CoreEvent::ExitConnectionOpenFailed { .. }
-            | CoreEvent::LocalConnectionBytes { .. }
-            | CoreEvent::LocalConnectionClosed { .. } => Err(CoreError::UnsupportedEvent),
+            | CoreEvent::SessionBytes { .. }
+            | CoreEvent::SessionClosed { .. } => Err(CoreError::UnsupportedEvent),
         }
     }
 
@@ -826,7 +709,7 @@ impl RelayCore {
     }
 
     pub fn channel_count(&self) -> usize {
-        self.config.channels.len()
+        self.local_channels.channel_ids().count()
     }
 
     fn forward_envelope(
@@ -835,93 +718,50 @@ impl RelayCore {
         mut envelope: Envelope,
         actions: &mut Vec<CoreAction>,
     ) -> Result<(), CoreError> {
-        let channel_id = if !envelope.channel_plan.is_empty() {
-            let channel_id = envelope.channel_plan.remove(0);
-            if !self.router.is_usable(channel_id) {
-                return Err(CoreError::NoRoute);
-            }
-            channel_id
-        } else {
-            self.select_channel_for_destination(envelope.destination_node_id)?
-        };
-        envelope.return_trace.push(TraceEntry {
-            node_id: self.config.node_id,
-            channel_id,
-        });
+        if envelope.route_plan.is_empty() {
+            return Err(CoreError::NoRoute);
+        }
+        let channel_id = envelope.route_plan.remove(0);
+        if !self.local_channels.is_usable(channel_id) {
+            return Err(CoreError::NoRoute);
+        }
         actions.push(CoreAction::SendTransportPacket {
             channel_id,
-            bytes: encode_hop_packet(now_ms, &self.config.hop_key, envelope)?,
+            bytes: encode_hop_packet(
+                now_ms,
+                &self.config.envelope_key,
+                &mut self.envelope_random,
+                envelope,
+            )?,
         });
-        self.router.record_send(channel_id);
+        self.local_channels.record_send(channel_id);
         Ok(())
-    }
-
-    fn select_channel_for_destination(
-        &mut self,
-        destination_node_id: NodeId,
-    ) -> Result<ChannelId, CoreError> {
-        if let Some(route) = self
-            .config
-            .destination_routes
-            .iter()
-            .find(|route| route.destination_node_id == destination_node_id)
-        {
-            return self
-                .router
-                .select_candidate(route.channel_ids.iter().copied())
-                .ok_or(CoreError::NoRoute);
-        }
-        self.router.select_channel().ok_or(CoreError::NoRoute)
     }
 }
 
 fn validate_endpoint_config(config: &EndpointConfig) -> Result<(), ConfigError> {
-    if config.node_id == 0 {
+    if config.local_node_id == 0 {
         return Err(ConfigError::EmptyNodeId);
     }
-    if config.endpoint_id == 0 {
-        return Err(ConfigError::EmptyEndpointId);
+    if config.transport_mtu == 0 {
+        return Err(ConfigError::ZeroMtu);
     }
-    if config.default_destination_node_id == 0 {
-        return Err(ConfigError::EmptyNodeId);
-    }
-    validate_destination_routes(&config.destination_routes, &config.channels)?;
-    validate_channels(&config.channels)
-}
-
-fn validate_relay_config(config: &RelayConfig) -> Result<(), ConfigError> {
-    if config.node_id == 0 {
-        return Err(ConfigError::EmptyNodeId);
-    }
-    validate_destination_routes(&config.destination_routes, &config.channels)?;
-    validate_channels(&config.channels)
-}
-
-fn validate_channels(channels: &[ChannelConfig]) -> Result<(), ConfigError> {
-    for channel in channels {
-        if channel.mtu == 0 {
-            return Err(ConfigError::ZeroMtu(channel.channel_id));
+    let local_channels = LocalChannelTable::new(config.local_channels.iter().copied());
+    for node in &config.route_topology.nodes {
+        if node.node_id == config.local_node_id {
+            for channel in &node.channels {
+                if !local_channels.contains(channel.channel_id) {
+                    return Err(ConfigError::UnknownLocalChannel(channel.channel_id));
+                }
+            }
         }
     }
     Ok(())
 }
 
-fn validate_destination_routes(
-    routes: &[DestinationRoute],
-    channels: &[ChannelConfig],
-) -> Result<(), ConfigError> {
-    for route in routes {
-        if route.destination_node_id == 0 {
-            return Err(ConfigError::EmptyNodeId);
-        }
-        for channel_id in &route.channel_ids {
-            if !channels
-                .iter()
-                .any(|channel| channel.channel_id == *channel_id)
-            {
-                return Err(ConfigError::UnknownChannel(*channel_id));
-            }
-        }
+fn validate_relay_config(config: &RelayConfig) -> Result<(), ConfigError> {
+    if config.local_node_id == 0 {
+        return Err(ConfigError::EmptyNodeId);
     }
     Ok(())
 }
@@ -929,42 +769,89 @@ fn validate_destination_routes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routing::{RouteChannel, RouteNode};
 
-    const TEST_HOP_KEY: [u8; 16] = [2; 16];
-    const TEST_ENDPOINT_KEY: [u8; 16] = [3; 16];
+    const TEST_ENVELOPE_KEY: [u8; 16] = [2; 16];
+    const TEST_MESSAGE_KEY: [u8; 16] = [3; 16];
+    const TEST_SEED: [u8; 16] = [4; 16];
 
-    fn channel(channel_id: ChannelId) -> ChannelConfig {
-        ChannelConfig {
-            channel_id,
-            peer_node_id: channel_id + 10,
-            mtu: 1200,
+    fn topology(local: NodeId, route: &[(ChannelId, NodeId)]) -> RouteTopology {
+        let mut nodes = vec![RouteNode {
+            node_id: local,
+            channels: route
+                .iter()
+                .map(|(channel_id, peer_node_id)| RouteChannel {
+                    channel_id: *channel_id,
+                    peer_node_id: *peer_node_id,
+                })
+                .collect(),
+        }];
+        if let Some((_, destination)) = route.last() {
+            nodes.push(RouteNode {
+                node_id: *destination,
+                channels: Vec::new(),
+            });
         }
+        RouteTopology { nodes }
+    }
+
+    fn endpoint(local_node_id: NodeId, channel_id: ChannelId, peer: NodeId) -> EndpointCore {
+        EndpointCore::new(EndpointConfig {
+            local_node_id,
+            envelope_key: TEST_ENVELOPE_KEY,
+            message_key: TEST_MESSAGE_KEY,
+            random_seed: TEST_SEED,
+            local_channels: vec![channel_id],
+            route_topology: topology(local_node_id, &[(channel_id, peer)]),
+            transport_mtu: 1200,
+        })
+        .unwrap()
+    }
+
+    fn relay(local_node_id: NodeId, channels: Vec<ChannelId>) -> RelayCore {
+        RelayCore::new(RelayConfig {
+            local_node_id,
+            envelope_key: TEST_ENVELOPE_KEY,
+            random_seed: TEST_SEED,
+            local_channels: channels,
+        })
+        .unwrap()
     }
 
     fn encode_test_packet(now_ms: u64, envelope: Envelope) -> Vec<u8> {
-        encode_hop_packet(now_ms, &TEST_HOP_KEY, envelope).unwrap()
+        let mut random = RandomStream::new(TEST_SEED, b"test");
+        encode_hop_packet(now_ms, &TEST_ENVELOPE_KEY, &mut random, envelope).unwrap()
     }
 
     fn decode_test_packet(now_ms: u64, bytes: &[u8]) -> Envelope {
         let mut nonce_filter = NonceFilter::new(1 << 24, 0.00001, 1 << 16, 0);
-        decode_hop_packet(now_ms, &TEST_HOP_KEY, &mut nonce_filter, bytes).unwrap()
+        decode_hop_packet(now_ms, &TEST_ENVELOPE_KEY, &mut nonce_filter, bytes).unwrap()
+    }
+
+    fn first_created_conv(actions: &[CoreAction]) -> ConvId {
+        actions
+            .iter()
+            .find_map(|action| match action {
+                CoreAction::IngressSessionCreated { conv_id } => Some(*conv_id),
+                _ => None,
+            })
+            .expect("ingress session created action")
     }
 
     #[test]
-    fn relay_consumes_next_channel_from_envelope_plan() {
-        let mut relay = RelayCore::new(RelayConfig {
-            node_id: 2,
-            hop_key: TEST_HOP_KEY,
-            destination_routes: Vec::new(),
-            channels: vec![channel(2), channel(3)],
-        })
-        .unwrap();
+    fn allocation_wraps_through_zero() {
+        let mut core = endpoint(1, 2, 9);
+        core.next_conv_id = u64::MAX;
+
+        assert_eq!(core.allocate_conv_id(), u64::MAX);
+        assert_eq!(core.allocate_conv_id(), 0);
+    }
+
+    #[test]
+    fn relay_consumes_next_channel_from_route_plan() {
+        let mut relay = relay(2, vec![2, 3]);
         let envelope = Envelope {
-            packet_type: PacketType::Data,
-            source_node_id: 1,
-            destination_node_id: 9,
-            channel_plan: vec![2, 3],
-            return_trace: Vec::new(),
+            route_plan: vec![2, 3],
             payload: b"kcp".to_vec(),
         };
         let mut actions = Vec::new();
@@ -986,45 +873,14 @@ mod tests {
         assert_eq!(*channel_id, 2);
 
         let forwarded = decode_test_packet(100, bytes);
-        assert_eq!(forwarded.channel_plan, vec![3]);
-        assert_eq!(
-            forwarded.return_trace,
-            vec![TraceEntry {
-                node_id: 2,
-                channel_id: 2,
-            }]
-        );
+        assert_eq!(forwarded.route_plan, vec![3]);
     }
 
     #[test]
-    fn relay_rejects_down_channel_from_envelope_plan() {
-        let mut relay = RelayCore::new(RelayConfig {
-            node_id: 2,
-            hop_key: TEST_HOP_KEY,
-            destination_routes: Vec::new(),
-            channels: vec![channel(2), channel(3)],
-        })
-        .unwrap();
-        relay
-            .handle_event(
-                90,
-                CoreEvent::TransportChannelUpdated {
-                    channel_id: 2,
-                    state: ChannelState::Down,
-                    metrics: TransportMetrics {
-                        queue_pressure: 0.0,
-                        send_error: true,
-                    },
-                },
-                &mut Vec::new(),
-            )
-            .unwrap();
+    fn relay_rejects_empty_route_plan() {
+        let mut relay = relay(2, vec![2, 3]);
         let envelope = Envelope {
-            packet_type: PacketType::Data,
-            source_node_id: 1,
-            destination_node_id: 9,
-            channel_plan: vec![2, 3],
-            return_trace: Vec::new(),
+            route_plan: Vec::new(),
             payload: b"kcp".to_vec(),
         };
         let mut actions = Vec::new();
@@ -1043,84 +899,15 @@ mod tests {
     }
 
     #[test]
-    fn relay_uses_destination_route_when_plan_is_empty() {
-        let mut relay = RelayCore::new(RelayConfig {
-            node_id: 2,
-            hop_key: TEST_HOP_KEY,
-            destination_routes: vec![DestinationRoute {
-                destination_node_id: 9,
-                channel_ids: vec![3],
-            }],
-            channels: vec![channel(2), channel(3)],
-        })
-        .unwrap();
-        let envelope = Envelope {
-            packet_type: PacketType::Data,
-            source_node_id: 1,
-            destination_node_id: 9,
-            channel_plan: Vec::new(),
-            return_trace: Vec::new(),
-            payload: b"kcp".to_vec(),
-        };
-        let mut actions = Vec::new();
-
-        relay
-            .handle_event(
-                100,
-                CoreEvent::TransportPacketReceived {
-                    channel_id: 1,
-                    bytes: encode_test_packet(100, envelope),
-                },
-                &mut actions,
-            )
-            .unwrap();
-
-        let [CoreAction::SendTransportPacket { channel_id, bytes }] = actions.as_slice() else {
-            panic!("expected exactly one send action");
-        };
-        assert_eq!(*channel_id, 3);
-
-        let forwarded = decode_test_packet(100, bytes);
-        assert_eq!(
-            forwarded.return_trace,
-            vec![TraceEntry {
-                node_id: 2,
-                channel_id: 3,
-            }]
-        );
-    }
-
-    #[test]
     fn endpoint_ingress_open_reaches_remote_endpoint() {
-        let mut endpoint = EndpointCore::new(EndpointConfig {
-            node_id: 1,
-            endpoint_id: 1,
-            hop_key: TEST_HOP_KEY,
-            endpoint_key: TEST_ENDPOINT_KEY,
-            default_destination_node_id: 9,
-            default_channel_plan: vec![2],
-            destination_routes: Vec::new(),
-            channels: vec![channel(2), channel(3)],
-        })
-        .unwrap();
-        let mut remote = EndpointCore::new(EndpointConfig {
-            node_id: 9,
-            endpoint_id: 1,
-            hop_key: TEST_HOP_KEY,
-            endpoint_key: TEST_ENDPOINT_KEY,
-            default_destination_node_id: 1,
-            default_channel_plan: vec![4],
-            destination_routes: Vec::new(),
-            channels: vec![channel(4)],
-        })
-        .unwrap();
+        let mut entry = endpoint(1, 2, 9);
+        let mut exit = endpoint(9, 4, 1);
         let mut actions = Vec::new();
 
-        endpoint
+        entry
             .handle_event(
                 100,
-                CoreEvent::IngressConnectionOpened {
-                    local_connection_id: 77,
+                CoreEvent::IngressSessionRequested {
                     target: Target {
                         host: "example.com".to_string(),
                         port: 443,
@@ -1131,70 +918,47 @@ mod tests {
             )
             .unwrap();
 
-        let Some(CoreAction::SendTransportPacket { channel_id, bytes }) = actions.first() else {
+        let conv_id = first_created_conv(&actions);
+        let Some(CoreAction::SendTransportPacket { channel_id, bytes }) = actions
+            .iter()
+            .find(|action| matches!(action, CoreAction::SendTransportPacket { .. }))
+        else {
             panic!("expected send transport packet action");
         };
         assert_eq!(*channel_id, 2);
+        assert!(decode_test_packet(100, bytes).route_plan.is_empty());
 
-        let envelope = decode_test_packet(100, bytes);
-        assert_eq!(envelope.source_node_id, 1);
-        assert_eq!(envelope.destination_node_id, 9);
-        assert!(envelope.channel_plan.is_empty());
-        assert!(EndpointFrame::decode(&envelope.payload).is_err());
+        let mut exit_actions = Vec::new();
+        exit.handle_event(
+            110,
+            CoreEvent::TransportPacketReceived {
+                channel_id: 4,
+                bytes: bytes.clone(),
+            },
+            &mut exit_actions,
+        )
+        .unwrap();
 
-        let mut remote_actions = Vec::new();
-        remote
-            .handle_event(
-                110,
-                CoreEvent::TransportPacketReceived {
-                    channel_id: 4,
-                    bytes: bytes.clone(),
-                },
-                &mut remote_actions,
-            )
-            .unwrap();
-
-        assert!(remote_actions.iter().any(|action| matches!(
+        assert!(exit_actions.iter().any(|action| matches!(
             action,
             CoreAction::OpenExitConnection {
-                stream_id: 1,
+                conv_id: opened,
                 target: Target { port: 443, .. },
                 ..
-            }
+            } if *opened == conv_id
         )));
     }
 
     #[test]
-    fn endpoint_local_bytes_reach_remote_stream() {
-        let mut endpoint = EndpointCore::new(EndpointConfig {
-            node_id: 1,
-            endpoint_id: 1,
-            hop_key: TEST_HOP_KEY,
-            endpoint_key: TEST_ENDPOINT_KEY,
-            default_destination_node_id: 9,
-            default_channel_plan: vec![2],
-            destination_routes: Vec::new(),
-            channels: vec![channel(2)],
-        })
-        .unwrap();
-        let mut remote = EndpointCore::new(EndpointConfig {
-            node_id: 9,
-            endpoint_id: 1,
-            hop_key: TEST_HOP_KEY,
-            endpoint_key: TEST_ENDPOINT_KEY,
-            default_destination_node_id: 1,
-            default_channel_plan: vec![4],
-            destination_routes: Vec::new(),
-            channels: vec![channel(4)],
-        })
-        .unwrap();
+    fn endpoint_session_bytes_reach_remote_session() {
+        let mut entry = endpoint(1, 2, 9);
+        let mut exit = endpoint(9, 4, 1);
         let mut actions = Vec::new();
 
-        endpoint
+        entry
             .handle_event(
                 100,
-                CoreEvent::IngressConnectionOpened {
-                    local_connection_id: 77,
+                CoreEvent::IngressSessionRequested {
                     target: Target {
                         host: "example.com".to_string(),
                         port: 443,
@@ -1204,48 +968,42 @@ mod tests {
                 &mut actions,
             )
             .unwrap();
+        let conv_id = first_created_conv(&actions);
         let open_packet = actions
             .iter()
             .find_map(|action| match action {
                 CoreAction::SendTransportPacket { bytes, .. } => Some(bytes.clone()),
                 _ => None,
             })
-            .expect("open stream packet");
+            .expect("open session packet");
 
-        let mut remote_actions = Vec::new();
-        remote
-            .handle_event(
-                110,
-                CoreEvent::TransportPacketReceived {
-                    channel_id: 4,
-                    bytes: open_packet,
-                },
-                &mut remote_actions,
-            )
-            .unwrap();
-        assert!(
-            remote_actions.iter().any(|action| matches!(
-                action,
-                CoreAction::OpenExitConnection { stream_id: 1, .. }
-            ))
-        );
-        remote
-            .handle_event(
-                111,
-                CoreEvent::ExitConnectionOpened {
-                    stream_id: 1,
-                    local_connection_id: 88,
-                },
-                &mut Vec::new(),
-            )
-            .unwrap();
+        let mut exit_actions = Vec::new();
+        exit.handle_event(
+            110,
+            CoreEvent::TransportPacketReceived {
+                channel_id: 4,
+                bytes: open_packet,
+            },
+            &mut exit_actions,
+        )
+        .unwrap();
+        assert!(exit_actions.iter().any(|action| matches!(
+            action,
+            CoreAction::OpenExitConnection { conv_id: opened, .. } if *opened == conv_id
+        )));
+        exit.handle_event(
+            111,
+            CoreEvent::ExitConnectionOpened { conv_id },
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         actions.clear();
-        endpoint
+        entry
             .handle_event(
                 101,
-                CoreEvent::LocalConnectionBytes {
-                    local_connection_id: 77,
+                CoreEvent::SessionBytes {
+                    conv_id,
                     bytes: b"hello".to_vec(),
                 },
                 &mut actions,
@@ -1258,26 +1016,25 @@ mod tests {
                 CoreAction::SendTransportPacket { bytes, .. } => Some(bytes.clone()),
                 _ => None,
             })
-            .expect("stream bytes packet");
+            .expect("connection bytes packet");
 
         let mut data_actions = Vec::new();
-        remote
-            .handle_event(
-                120,
-                CoreEvent::TransportPacketReceived {
-                    channel_id: 4,
-                    bytes: data_packet,
-                },
-                &mut data_actions,
-            )
-            .unwrap();
+        exit.handle_event(
+            120,
+            CoreEvent::TransportPacketReceived {
+                channel_id: 4,
+                bytes: data_packet,
+            },
+            &mut data_actions,
+        )
+        .unwrap();
 
         assert!(data_actions.iter().any(|action| matches!(
             action,
-            CoreAction::WriteLocalConnection {
-                local_connection_id: 88,
+            CoreAction::WriteSession {
+                conv_id: written,
                 bytes,
-            } if bytes == b"hello"
+            } if *written == conv_id && bytes == b"hello"
         )));
     }
 }

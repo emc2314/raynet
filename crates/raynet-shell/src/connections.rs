@@ -2,71 +2,72 @@ use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::net::SocketAddr;
 
-use raynet_core::core::LocalConnectionId;
-use raynet_core::utils::UnwrapNone;
+use raynet_core::ConvId;
 
 pub struct Connections {
-    cons: HashMap<SocketAddr, tokio::net::tcp::OwnedWriteHalf>,
-    local_ids: HashMap<SocketAddr, LocalConnectionId>,
-    local_addrs: HashMap<LocalConnectionId, SocketAddr>,
-    next_local_id: LocalConnectionId,
+    sessions: HashMap<ConvId, tokio::net::tcp::OwnedWriteHalf>,
+    addrs: HashMap<SocketAddr, ConvId>,
+    pending: HashMap<SocketAddr, tokio::net::tcp::OwnedWriteHalf>,
 }
 
 impl Connections {
     pub fn new() -> Connections {
         Connections {
-            cons: HashMap::new(),
-            local_ids: HashMap::new(),
-            local_addrs: HashMap::new(),
-            next_local_id: 1,
+            sessions: HashMap::new(),
+            addrs: HashMap::new(),
+            pending: HashMap::new(),
         }
     }
 
-    pub fn remove(self: &mut Connections, addr: &SocketAddr) {
-        self.cons.remove(addr);
-        if let Some(local_connection_id) = self.local_ids.remove(addr) {
-            self.local_addrs.remove(&local_connection_id);
-        }
+    pub fn insert_pending(&mut self, addr: SocketAddr, write: tokio::net::tcp::OwnedWriteHalf) {
+        self.pending.insert(addr, write);
     }
 
-    pub fn insert(
-        self: &mut Connections,
+    pub fn bind_pending(&mut self, addr: SocketAddr, conv_id: ConvId) -> bool {
+        let Some(write) = self.pending.remove(&addr) else {
+            return false;
+        };
+        self.sessions.insert(conv_id, write);
+        self.addrs.insert(addr, conv_id);
+        true
+    }
+
+    pub fn insert_session(
+        &mut self,
         addr: SocketAddr,
+        conv_id: ConvId,
         write: tokio::net::tcp::OwnedWriteHalf,
-    ) -> LocalConnectionId {
-        self.cons.insert(addr, write).unwrap_none();
-        let local_connection_id = self.next_local_id;
-        self.next_local_id = self.next_local_id.saturating_add(1).max(1);
-        self.local_ids.insert(addr, local_connection_id);
-        self.local_addrs.insert(local_connection_id, addr);
-        local_connection_id
+    ) {
+        self.sessions.insert(conv_id, write);
+        self.addrs.insert(addr, conv_id);
     }
 
-    pub fn get_by_local_connection_id(
-        self: &Connections,
-        local_connection_id: LocalConnectionId,
-    ) -> Option<&tokio::net::tcp::OwnedWriteHalf> {
-        self.local_addrs
-            .get(&local_connection_id)
-            .and_then(|addr| self.cons.get(addr))
-    }
-
-    pub fn local_connection_id(&self, addr: &SocketAddr) -> Option<LocalConnectionId> {
-        self.local_ids.get(addr).copied()
-    }
-
-    pub fn remove_by_local_connection_id(&mut self, local_connection_id: LocalConnectionId) {
-        if let Some(addr) = self.local_addrs.remove(&local_connection_id) {
-            self.local_ids.remove(&addr);
-            self.cons.remove(&addr);
+    pub fn remove_addr(&mut self, addr: &SocketAddr) {
+        self.pending.remove(addr);
+        if let Some(conv_id) = self.addrs.remove(addr) {
+            self.sessions.remove(&conv_id);
         }
+    }
+
+    pub fn remove_conv(&mut self, conv_id: ConvId) {
+        self.sessions.remove(&conv_id);
+        self.addrs.retain(|_, mapped| *mapped != conv_id);
+    }
+
+    pub fn conv_id(&self, addr: &SocketAddr) -> Option<ConvId> {
+        self.addrs.get(addr).copied()
+    }
+
+    pub fn get(&self, conv_id: ConvId) -> Option<&tokio::net::tcp::OwnedWriteHalf> {
+        self.sessions.get(&conv_id)
     }
 }
 
 impl Debug for Connections {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Connections")
-            .field("cons", &self.cons.keys())
+            .field("sessions", &self.sessions.keys())
+            .field("pending", &self.pending.keys())
             .finish()
     }
 }

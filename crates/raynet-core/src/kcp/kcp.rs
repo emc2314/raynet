@@ -33,7 +33,7 @@ const KCP_MTU_DEF: usize = 1400;
 
 const KCP_INTERVAL: u32 = 100;
 /// KCP Header size
-pub const KCP_OVERHEAD: usize = 24;
+pub const KCP_OVERHEAD: usize = 28;
 const KCP_DEADLINK: u32 = 20;
 
 const KCP_THRESH_INIT: u16 = 2;
@@ -44,23 +44,23 @@ const KCP_PROBE_LIMIT: u32 = 120000; // up to 120 secs to probe window
 const KCP_FASTACK_LIMIT: u32 = 5; // max times to trigger fastack
 
 /// Read `conv` from raw buffer
-pub fn get_conv(mut buf: &[u8]) -> u32 {
+pub fn get_conv(mut buf: &[u8]) -> u64 {
     assert!(buf.len() >= KCP_OVERHEAD);
-    buf.get_u32_le()
+    buf.get_u64_le()
 }
 
 /// Set `conv` to raw buffer
 #[allow(dead_code)]
-pub fn set_conv(mut buf: &mut [u8], conv: u32) {
+pub fn set_conv(mut buf: &mut [u8], conv: u64) {
     assert!(buf.len() >= KCP_OVERHEAD);
-    buf.put_u32_le(conv)
+    buf.put_u64_le(conv)
 }
 
 /// Get `sn` from raw buffer
 #[allow(dead_code)]
 pub fn get_sn(buf: &[u8]) -> u32 {
     assert!(buf.len() >= KCP_OVERHEAD);
-    (&buf[12..]).get_u32_le()
+    (&buf[16..]).get_u32_le()
 }
 
 #[inline]
@@ -75,7 +75,7 @@ fn timediff(later: u32, earlier: u32) -> i32 {
 
 #[derive(Default, Clone, Debug)]
 struct KcpSegment {
-    conv: u32,
+    conv: u64,
     cmd: u8,
     frg: u8,
     wnd: u16,
@@ -117,7 +117,7 @@ impl KcpSegment {
             );
         }
 
-        buf.put_u32_le(self.conv);
+        buf.put_u64_le(self.conv);
         buf.put_u8(self.cmd);
         buf.put_u8(self.frg);
         buf.put_u16_le(self.wnd);
@@ -153,7 +153,7 @@ impl<O: Write> Write for KcpOutput<O> {
 #[derive(Default)]
 pub struct Kcp<Output> {
     /// Conversation ID
-    conv: u32,
+    conv: u64,
     /// Maximum Transmission Unit
     mtu: usize,
     /// Maximum Segment Size
@@ -289,7 +289,7 @@ impl<Output> Kcp<Output> {
     /// `output` is the callback object for writing.
     ///
     /// `conv` represents conversation.
-    pub fn new(conv: u32, output: Output) -> Self {
+    pub fn new(conv: u64, output: Output) -> Self {
         Kcp::construct(conv, output, false)
     }
 
@@ -297,11 +297,11 @@ impl<Output> Kcp<Output> {
     /// `output` is the callback object for writing.
     ///
     /// `conv` represents conversation.
-    pub fn new_stream(conv: u32, output: Output) -> Self {
+    pub fn new_stream(conv: u64, output: Output) -> Self {
         Kcp::construct(conv, output, true)
     }
 
-    fn construct(conv: u32, output: Output, stream: bool) -> Self {
+    fn construct(conv: u64, output: Output, stream: bool) -> Self {
         Kcp {
             conv,
             snd_una: 0,
@@ -625,13 +625,13 @@ impl<Output> Kcp<Output> {
 
     /// Set `conv` value
     #[inline]
-    pub fn set_conv(&mut self, conv: u32) {
+    pub fn set_conv(&mut self, conv: u64) {
         self.conv = conv;
     }
 
     /// Get `conv`
     #[inline]
-    pub fn conv(&self) -> u32 {
+    pub fn conv(&self) -> u64 {
         self.conv
     }
 
@@ -657,7 +657,7 @@ impl<Output> Kcp<Output> {
 
         let mut buf = Cursor::new(buf);
         while buf.remaining() >= KCP_OVERHEAD {
-            let conv = buf.get_u32_le();
+            let conv = buf.get_u64_le();
             if conv != self.conv {
                 // This allows getting conv from this call, which allows us to allocate
                 // conv from the server side.

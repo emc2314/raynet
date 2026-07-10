@@ -5,7 +5,7 @@ use std::io::{self, ErrorKind};
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("conv inconsistent, expected {0}, found {1}")]
-    ConvInconsistent(u32, u32),
+    ConvInconsistent(u64, u64),
     #[error("invalid mtu {0}")]
     InvalidMtu(usize),
     #[error("invalid segment size {0}")]

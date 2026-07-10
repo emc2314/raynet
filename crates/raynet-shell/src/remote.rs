@@ -14,7 +14,7 @@ use crate::connections::Connections;
 use crate::transport::OutboundTransportPacket;
 use crate::utils::now_millis;
 use raynet_core::core::{CoreAction, CoreEvent, EndpointCore};
-use raynet_core::{ChannelId, ChannelRouter, ChannelState, RelayCore, TransportMetrics};
+use raynet_core::{ChannelId, ConvId, OpenFailureReason, RelayCore};
 
 async fn send_udp(socket: &UdpSocket, remote: SocketAddr, bytes: &[u8], buf: &mut [u8]) -> bool {
     if bytes.len() > buf.len() {
@@ -32,7 +32,7 @@ async fn send_udp(socket: &UdpSocket, remote: SocketAddr, bytes: &[u8], buf: &mu
             true
         }
         Err(e) => {
-            error!("UDP Failed to send to {}: {}", remote, e);
+            error!("UDP failed to send to {}: {}", remote, e);
             false
         }
     }
@@ -41,7 +41,6 @@ async fn send_udp(socket: &UdpSocket, remote: SocketAddr, bytes: &[u8], buf: &mu
 async fn udp_in<F, Fut>(
     udp_socket: Arc<UdpSocket>,
     channels: Arc<UdpChannels>,
-    router: Arc<Mutex<ChannelRouter>>,
     mut process_packet: F,
 ) where
     F: FnMut(ChannelId, Vec<u8>) -> Fut,
@@ -54,9 +53,6 @@ async fn udp_in<F, Fut>(
             Ok((size, src)) => {
                 debug!("Received {} bytes from {}", size, src);
                 let channel_id = channels.channel_id_for_addr(src).unwrap_or(0);
-                if channel_id != 0 {
-                    router.lock().await.record_receive(channel_id);
-                }
                 process_packet(channel_id, buf[..size].to_vec()).await;
             }
             Err(e) => error!("Failed to receive from UDP: {}", e),
@@ -68,7 +64,6 @@ pub async fn forward_in(
     udp_socket: Arc<UdpSocket>,
     ray_tx: mpsc::Sender<OutboundTransportPacket>,
     channels: Arc<UdpChannels>,
-    router: Arc<Mutex<ChannelRouter>>,
     relay_core: Arc<Mutex<RelayCore>>,
 ) {
     let process_forward = |channel_id: ChannelId, bytes: Vec<u8>| {
@@ -84,34 +79,19 @@ pub async fn forward_in(
                 .handle_event(now_millis(), event, &mut actions);
 
             match result {
-                Ok(()) => {
-                    for action in actions {
-                        if let CoreAction::SendTransportPacket { channel_id, bytes } = action {
-                            if let Err(e) = ray_tx
-                                .send(OutboundTransportPacket {
-                                    channel_id: Some(channel_id),
-                                    bytes,
-                                })
-                                .await
-                            {
-                                error!("Failed to send core action to channel: {}", e);
-                            }
-                        }
-                    }
-                }
+                Ok(()) => send_transport_actions(ray_tx, actions).await,
                 Err(error) => warn!("RelayCore rejected transport packet: {}", error),
             }
         }
     };
 
-    udp_in(udp_socket, channels, router, process_forward).await;
+    udp_in(udp_socket, channels, process_forward).await;
 }
 
 pub async fn endpoint_in(
     udp_socket: Arc<UdpSocket>,
     connections: Arc<RwLock<Connections>>,
     channels: Arc<UdpChannels>,
-    router: Arc<Mutex<ChannelRouter>>,
     endpoint_core: Arc<Mutex<EndpointCore>>,
     ray_tx: mpsc::Sender<OutboundTransportPacket>,
 ) {
@@ -120,46 +100,22 @@ pub async fn endpoint_in(
         let endpoint_core = endpoint_core.clone();
         let ray_tx = ray_tx.clone();
         async move {
-            let handled = handle_endpoint_envelope(
-                connections.clone(),
-                endpoint_core,
-                ray_tx,
-                channel_id,
-                bytes,
-            )
-            .await;
-            if !handled {
-                warn!("Dropping non-envelope endpoint packet");
+            let mut actions = Vec::new();
+            let event = CoreEvent::TransportPacketReceived { channel_id, bytes };
+            let result = endpoint_core
+                .lock()
+                .await
+                .handle_event(now_millis(), event, &mut actions);
+            match result {
+                Ok(()) => {
+                    handle_endpoint_core_actions(connections, endpoint_core, ray_tx, actions).await
+                }
+                Err(error) => warn!("EndpointCore rejected transport packet: {}", error),
             }
         }
     };
 
-    udp_in(udp_socket, channels, router, process_endpoint).await;
-}
-
-async fn handle_endpoint_envelope(
-    connections: Arc<RwLock<Connections>>,
-    endpoint_core: Arc<Mutex<EndpointCore>>,
-    ray_tx: mpsc::Sender<OutboundTransportPacket>,
-    channel_id: ChannelId,
-    bytes: Vec<u8>,
-) -> bool {
-    let mut actions = Vec::new();
-    let event = CoreEvent::TransportPacketReceived { channel_id, bytes };
-    let result = endpoint_core
-        .lock()
-        .await
-        .handle_event(now_millis(), event, &mut actions);
-    match result {
-        Ok(()) => {
-            handle_endpoint_core_actions(connections, endpoint_core, ray_tx, actions).await;
-            true
-        }
-        Err(error) => {
-            warn!("EndpointCore rejected transport packet: {}", error);
-            false
-        }
-    }
+    udp_in(udp_socket, channels, process_endpoint).await;
 }
 
 async fn handle_endpoint_core_actions(
@@ -171,38 +127,29 @@ async fn handle_endpoint_core_actions(
     for action in actions {
         match action {
             CoreAction::OpenExitConnection {
-                stream_id, target, ..
+                conv_id, target, ..
             } => {
                 open_exit_connection(
                     connections.clone(),
                     endpoint_core.clone(),
                     ray_tx.clone(),
-                    stream_id,
+                    conv_id,
                     target,
                 )
                 .await;
             }
-            CoreAction::WriteLocalConnection {
-                local_connection_id,
-                bytes,
-            } => {
-                write_local_connection(connections.clone(), local_connection_id, bytes).await;
+            CoreAction::WriteSession { conv_id, bytes } => {
+                write_session(connections.clone(), conv_id, bytes).await;
             }
-            CoreAction::CloseLocalConnection {
-                local_connection_id,
-                ..
-            } => {
-                connections
-                    .write()
-                    .await
-                    .remove_by_local_connection_id(local_connection_id);
+            CoreAction::CloseSession { conv_id, .. } => {
+                connections.write().await.remove_conv(conv_id);
             }
             CoreAction::SendTransportPacket { channel_id, bytes } => {
                 send_transport_action(ray_tx.clone(), channel_id, bytes).await;
             }
-            CoreAction::CloseRemoteStream { .. }
+            CoreAction::IngressSessionCreated { .. }
             | CoreAction::EmitMetric(_)
-            | CoreAction::EmitLog { .. } => {}
+            | CoreAction::EmitEvent(_) => {}
         }
     }
 }
@@ -211,7 +158,7 @@ async fn open_exit_connection(
     connections: Arc<RwLock<Connections>>,
     endpoint_core: Arc<Mutex<EndpointCore>>,
     ray_tx: mpsc::Sender<OutboundTransportPacket>,
-    stream_id: u64,
+    conv_id: ConvId,
     target: raynet_core::Target,
 ) {
     let target_addr = format!("{}:{}", target.host, target.port);
@@ -222,6 +169,15 @@ async fn open_exit_connection(
                 "Failed to open exit connection to {}: {}",
                 target_addr, error
             );
+            emit_endpoint_core_event(
+                endpoint_core,
+                ray_tx,
+                CoreEvent::ExitConnectionOpenFailed {
+                    conv_id,
+                    reason: OpenFailureReason::Error(error.to_string()),
+                },
+            )
+            .await;
             return;
         }
     };
@@ -233,29 +189,24 @@ async fn open_exit_connection(
         }
     };
     let (read, write) = stream.into_split();
-    let local_connection_id = connections.write().await.insert(addr, write);
+    connections
+        .write()
+        .await
+        .insert_session(addr, conv_id, write);
 
     emit_endpoint_core_event(
         endpoint_core.clone(),
         ray_tx.clone(),
-        CoreEvent::ExitConnectionOpened {
-            stream_id,
-            local_connection_id,
-        },
+        CoreEvent::ExitConnectionOpened { conv_id },
     )
     .await;
 
-    tokio::spawn(read_exit_connection(
-        read,
-        local_connection_id,
-        endpoint_core,
-        ray_tx,
-    ));
+    tokio::spawn(read_exit_connection(read, conv_id, endpoint_core, ray_tx));
 }
 
 async fn read_exit_connection(
     read: tokio::net::tcp::OwnedReadHalf,
-    local_connection_id: u64,
+    conv_id: ConvId,
     endpoint_core: Arc<Mutex<EndpointCore>>,
     ray_tx: mpsc::Sender<OutboundTransportPacket>,
 ) {
@@ -266,8 +217,8 @@ async fn read_exit_connection(
                 emit_endpoint_core_event(
                     endpoint_core,
                     ray_tx,
-                    CoreEvent::LocalConnectionClosed {
-                        local_connection_id,
+                    CoreEvent::SessionClosed {
+                        conv_id,
                         reason: raynet_core::CloseReason::RemoteClosed,
                     },
                 )
@@ -278,8 +229,8 @@ async fn read_exit_connection(
                 emit_endpoint_core_event(
                     endpoint_core.clone(),
                     ray_tx.clone(),
-                    CoreEvent::LocalConnectionBytes {
-                        local_connection_id,
+                    CoreEvent::SessionBytes {
+                        conv_id,
                         bytes: buf[..len].to_vec(),
                     },
                 )
@@ -292,8 +243,8 @@ async fn read_exit_connection(
                 emit_endpoint_core_event(
                     endpoint_core,
                     ray_tx,
-                    CoreEvent::LocalConnectionClosed {
-                        local_connection_id,
+                    CoreEvent::SessionClosed {
+                        conv_id,
                         reason: raynet_core::CloseReason::Error(error.to_string()),
                     },
                 )
@@ -304,17 +255,10 @@ async fn read_exit_connection(
     }
 }
 
-async fn write_local_connection(
-    connections: Arc<RwLock<Connections>>,
-    local_connection_id: u64,
-    bytes: Vec<u8>,
-) {
+async fn write_session(connections: Arc<RwLock<Connections>>, conv_id: ConvId, bytes: Vec<u8>) {
     let connections = connections.read().await;
-    let Some(write) = connections.get_by_local_connection_id(local_connection_id) else {
-        warn!(
-            "No local connection {} for write action",
-            local_connection_id
-        );
+    let Some(write) = connections.get(conv_id) else {
+        warn!("No local session {} for write action", conv_id);
         return;
     };
     let mut remaining = bytes.as_slice();
@@ -325,10 +269,7 @@ async fn write_local_connection(
                 sleep(Duration::from_millis(1)).await;
             }
             Err(error) => {
-                error!(
-                    "Failed to write to local connection {}: {}",
-                    local_connection_id, error
-                );
+                error!("Failed to write to local session {}: {}", conv_id, error);
                 break;
             }
         }
@@ -346,14 +287,19 @@ async fn emit_endpoint_core_event(
         .await
         .handle_event(now_millis(), event, &mut actions)
     {
-        Ok(()) => {
-            for action in actions {
-                if let CoreAction::SendTransportPacket { channel_id, bytes } = action {
-                    send_transport_action(ray_tx.clone(), channel_id, bytes).await;
-                }
-            }
-        }
+        Ok(()) => send_transport_actions(ray_tx, actions).await,
         Err(error) => error!("EndpointCore rejected exit event: {}", error),
+    }
+}
+
+async fn send_transport_actions(
+    ray_tx: mpsc::Sender<OutboundTransportPacket>,
+    actions: Vec<CoreAction>,
+) {
+    for action in actions {
+        if let CoreAction::SendTransportPacket { channel_id, bytes } = action {
+            send_transport_action(ray_tx.clone(), channel_id, bytes).await;
+        }
     }
 }
 
@@ -363,10 +309,7 @@ async fn send_transport_action(
     bytes: Vec<u8>,
 ) {
     if let Err(error) = ray_tx
-        .send(OutboundTransportPacket {
-            channel_id: Some(channel_id),
-            bytes,
-        })
+        .send(OutboundTransportPacket { channel_id, bytes })
         .await
     {
         error!(
@@ -376,13 +319,9 @@ async fn send_transport_action(
     }
 }
 
-async fn udp_out<T, F>(
-    mut rx: mpsc::Receiver<T>,
-    channels: Arc<UdpChannels>,
-    router: Arc<Mutex<ChannelRouter>>,
-    process_packet: F,
-) where
-    F: Fn(T) -> (Option<ChannelId>, Vec<u8>),
+async fn udp_out<T, F>(mut rx: mpsc::Receiver<T>, channels: Arc<UdpChannels>, process_packet: F)
+where
+    F: Fn(T) -> (ChannelId, Vec<u8>),
 {
     let udp_socket_outs: Vec<UdpSocket> = join_all(
         (0..32)
@@ -399,50 +338,25 @@ async fn udp_out<T, F>(
             let mut rng = rand::rng();
             (0..udp_socket_outs.len()).choose(&mut rng).unwrap()
         };
-        let (requested_channel_id, packet) = process_packet(packet);
-        let channel_id = if let Some(channel_id) = requested_channel_id {
-            channel_id
-        } else {
-            let Some(channel_id) = router.lock().await.select_channel() else {
-                warn!("No available channel for outgoing packet");
-                continue;
-            };
-            channel_id
-        };
+        let (channel_id, packet) = process_packet(packet);
         let Some(remote) = channels.addr(channel_id) else {
             warn!("Selected channel {} has no UDP address", channel_id);
             continue;
         };
 
-        let sent = send_udp(
+        let _ = send_udp(
             &udp_socket_outs[udp_socket_index],
             remote,
             &packet,
             &mut buf,
         )
         .await;
-        let mut router = router.lock().await;
-        router.record_send(channel_id);
-        if !sent {
-            router.update_channel(
-                channel_id,
-                ChannelState::Degraded,
-                TransportMetrics {
-                    queue_pressure: 0.0,
-                    send_error: true,
-                },
-            );
-        }
     }
 }
 
 pub async fn forward_out(
     ray_rx: mpsc::Receiver<OutboundTransportPacket>,
     channels: Arc<UdpChannels>,
-    router: Arc<Mutex<ChannelRouter>>,
 ) {
-    udp_out(ray_rx, channels, router, |packet| {
-        (packet.channel_id, packet.bytes)
-    })
-    .await
+    udp_out(ray_rx, channels, |packet| (packet.channel_id, packet.bytes)).await
 }

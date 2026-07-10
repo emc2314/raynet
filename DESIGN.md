@@ -6,10 +6,10 @@ RayNet 是一个由 Rust core 和 runtime shell 共同组成的 overlay network�
 
 Core 是同步状态机，负责协议状态、加密、KCP session、relay forwarding 和单向 route plan 调度。Shell 负责真实 IO、timer、配置加载、启动熵、日志、ingress connector 和 exit connector。
 
-1. Entry endpoint 接收本地连接，把它变成一个 endpoint session。
+1. Entry endpoint 的 shell 接收本地连接，并请求 core 创建 endpoint session；core 分配 `ConvId` 并回传给 shell。
 2. Endpoint 发送 packet 时使用一个单向 `RoutePlan`。
-3. Relay 消费 `RoutePlan` 的第一项并转发，endpoint payload 始终由 endpoint 处理。
-4. Exit endpoint 为远端 session 打开真实服务连接，并把返回流量作为另一个方向独立发送。
+3. Relay 消费 `RoutePlan` 的第一项并转发，endpoint message 始终由 endpoint 处理。
+4. Exit endpoint 的 shell 按 core 输出的 `OpenExitConnection` 为远端 session 打开真实服务连接，并把返回流量作为另一个方向独立发送。
 
 传输 channel 可以是 UDP、TCP、HTTP、DNS、mailbox/file、GitHub upload/download 或其它 shell 能实现的东西。RayNet 通用配置不定义 channel kind。`ChannelId` 只是某个节点本地的 transport handle。
 
@@ -39,7 +39,7 @@ RayNet Core
   sync state machine
   opaque transport packet generation/parsing
   envelope authentication and encryption
-  endpoint encryption
+  endpoint message encryption
   KCP session
   route-plan forwarding
   channel health and scheduling
@@ -70,7 +70,7 @@ Exit Endpoint
   route health learning
 ```
 
-Entry 和 exit 是部署角色。两端都使用 `EndpointCore`。入口侧 shell 负责把本地 ingress 连接转换成 session；出口侧 shell 负责按 `OpenExitConnection` 连接真实服务。入口部署可以禁止执行 `OpenExitConnection`，以隔离 exit 节点被攻破后的反向风险。
+Entry 和 exit 是部署角色。两端都使用 `EndpointCore`。入口侧 shell 负责把本地 ingress 连接提交给 core，core 负责分配 `ConvId` 并创建 session；出口侧 shell 负责按 `OpenExitConnection` 连接真实服务。入口部署可以禁止执行 `OpenExitConnection`，以隔离 exit 节点被攻破后的反向风险。
 
 Relay 的行为固定为：认证解开 packet，消费 `route_plan[0]`，按指定本地 channel 发出。
 
@@ -116,7 +116,7 @@ envelope_key
   EndpointCore 和 RelayCore 都持有
 
 message_key
-  用于 endpoint payload 端到端认证加密
+  用于 endpoint message 端到端认证加密
   只有 EndpointCore 持有
 ```
 
@@ -146,22 +146,21 @@ ChannelId
   某个节点本地的 transport channel 编号
   在 route plan 中按当前节点的本地语义解释
 
-SessionId
-  endpoint session 编号
-  一个 session 对应一条被代理的本地连接
-  由发起侧 core 分配
-
-LocalConnectionId
-  endpoint shell 本地连接句柄
-  只存在于 entry/exit endpoint
+ConvId
+  endpoint session 编号，也是该 session 的 KCP conv
+  由发起侧 EndpointCore 分配
+  一个 session 对应 shell 暴露给 core 的一条逻辑连接
+  进入 KCP segment，并受 endpoint message 加密保护
 
 Target
   exit endpoint 要连接的目标描述
 ```
 
-`LocalConnectionId` 对应 entry 侧 ingress connection 或 exit 侧真实服务连接。Relay 不使用 `LocalConnectionId`。
+Socket、文件描述符、HTTP stream、平台连接句柄或其它本地连接资源都属于 shell。Shell 自己维护 `ConvId` 到本地连接资源的映射。
 
-`SessionId` 是协议里的 KCP session id。Entry 和 exit 用它对应同一条被代理连接。Shell 可以把 `SessionId` 当 opaque token 回传给 core，但不生成或解释它。
+`ConvId` 是协议里的 endpoint session id。Entry 和 exit 用它对应同一条被代理逻辑连接。Core 生成 `ConvId`，shell 只把它当 opaque token 绑定到本地连接资源。
+
+EndpointCore 分配 `ConvId` 时，从 `random_seed` 派生一个随机起点，然后使用单调 `u64` counter 分配后续 id。counter 溢出时按 `u64` 自然 wraparound；实现不保留特殊的 conv 值，也不扫描现有 session。
 
 ## 6. CoreEvent
 
@@ -176,25 +175,23 @@ CoreEvent
     state,
     metrics
   }
-  IngressConnectionOpened {
-    local_connection_id,
+  IngressSessionRequested {
     target,
     metadata
   }
   ExitConnectionOpened {
-    session_id,
-    local_connection_id
+    conv_id
   }
   ExitConnectionOpenFailed {
-    session_id,
+    conv_id,
     reason
   }
-  LocalConnectionBytes {
-    local_connection_id,
+  SessionBytes {
+    conv_id,
     bytes
   }
-  LocalConnectionClosed {
-    local_connection_id,
+  SessionClosed {
+    conv_id,
     reason
   }
 ```
@@ -211,17 +208,20 @@ CoreAction
     channel_id,
     bytes
   }
+  IngressSessionCreated {
+    conv_id
+  }
   OpenExitConnection {
-    session_id,
+    conv_id,
     target,
     metadata
   }
-  WriteLocalConnection {
-    local_connection_id,
+  WriteSession {
+    conv_id,
     bytes
   }
-  CloseLocalConnection {
-    local_connection_id,
+  CloseSession {
+    conv_id,
     reason
   }
   EmitMetric(metric)
@@ -229,6 +229,8 @@ CoreAction
 ```
 
 Shell 执行 `SendTransportPacket` 时必须使用 core 指定的 `channel_id`。Shell 不解释 `bytes`，只把它当 opaque bytes 发给指定 channel。
+
+Shell 执行 `IngressSessionCreated` 时，把返回的 `conv_id` 绑定到刚刚提交给 core 的 pending ingress 连接。之后 shell 对该连接的 `SessionBytes` 和 `SessionClosed` 事件都使用这个 `conv_id`。Shell 执行 `WriteSession` 和 `CloseSession` 时，用自己的 session map 找到真实本地连接资源。
 
 Core 输出结构化 event。Shell 负责 event 的呈现、聚合、指标转换和 trace 接入。
 
@@ -242,8 +244,8 @@ TransportPacket
 Envelope
   envelope 认证解开后的节点间转发单元
 
-EndpointPayload
-  endpoint 间端到端加密和认证的数据
+EndpointMessage
+  endpoint 间端到端加密和认证的数据；解密后是一个 KCP segment
 
 SessionFrame
   KCP reassembly 后的单连接 frame
@@ -265,12 +267,11 @@ Envelope
 
 Relay 只读取 `route_plan`。`payload` 对 relay 是 opaque bytes。
 
-Endpoint payload 解密后包含：
+Endpoint message 解密后得到一个完整 KCP segment。KCP segment header 里已经包含 `conv`，也就是 RayNet 的 `ConvId`，因此 endpoint message 明文不再额外包一层结构：
 
 ```text
-EndpointPayload
-  session_id
-  kcp_segment
+EndpointMessage plaintext = KcpSegment
+KcpSegment.header.conv = ConvId
 ```
 
 KCP reassembly 后，endpoint 解析 `SessionFrame`：
@@ -289,17 +290,21 @@ FrameType
   KeepAlive
 ```
 
-Envelope auth 使用认证加密保护 envelope，防止外部伪造或篡改。Message encryption/auth 保护 endpoint payload，relay 不持有 endpoint payload 的解密能力。
+Envelope auth 使用认证加密保护 envelope，防止外部伪造或篡改。Message encryption/auth 保护 endpoint message，relay 不持有 endpoint message 的解密能力。
 
-当前威胁模型信任已认证 relay，不把 relay compromise 作为主要防御目标。Relay 可能看到 route plan，但看不到 endpoint payload。
+当前威胁模型信任已认证 relay，不把 relay compromise 作为主要防御目标。Relay 可能看到 route plan，但看不到 endpoint message。
 
 ## 9. KCP 与 Session
 
-KCP 运行在 logical endpoint session 之间，作为端到端可靠传输机制，不绑定单个 link 或 channel。Relay 只转发 envelope，不理解 KCP segment、session id、exit target 或 endpoint payload。
+KCP 运行在 logical endpoint session 之间，作为端到端可靠传输机制，不绑定单个 link 或 channel。Relay 只转发 envelope，不理解 KCP segment、conv id、exit target 或 endpoint message。
 
-一个 ingress TCP connection 对应一个 endpoint session，也对应一个 KCP session。Shell 可以在 ingress/exit connector 层把多条本地连接复用成一条逻辑连接；core 看到的仍然是一条 session。
+一个 shell 暴露给 core 的逻辑连接对应一个 endpoint session，也对应一个 KCP session。通常一个 ingress TCP connection 会直接对应一个 session；shell 也可以在 ingress/exit connector 层把多条真实本地连接复用成一条逻辑连接，core 看到的仍然是一条 session。
 
-一个 `EndpointCore` 可以同时维护多个 endpoint session。每个 session 独立持有 KCP 状态、重传队列和本地连接映射。收到已认证 endpoint payload 后，如果 `session_id` 尚不存在，core 可以按该 session 的第一批 KCP segment 创建对应 session 状态。
+一个 `EndpointCore` 可以同时维护多个 endpoint session。每个 session 独立持有 KCP 状态和重传队列。Shell 维护 `ConvId` 到本地连接资源的映射。收到已认证 endpoint message 后，core 先从 KCP segment header 读取 `conv`，再用该 `ConvId` 找到对应 KCP session。如果该 `ConvId` 尚不存在，core 可以按该 session 的第一批 KCP segment 创建对应 session 状态。
+
+当前 KCP 实现是一个 `Kcp` 实例对应一个 conv。KCP 会校验输入 segment 的 conv 是否等于该实例的 conv，但不会管理多 conv。EndpointCore 负责维护 `ConvId -> KcpSession` 的 map，并在把 segment 交给 KCP 前完成 demux。
+
+Session 的生命周期由 shell 和 core 共同推进：shell 通过 `IngressSessionRequested`、`ExitConnectionOpened`、`SessionBytes` 和 `SessionClosed` 把本地 runtime 状态提交给 core；core 通过 `IngressSessionCreated`、`OpenExitConnection`、`WriteSession` 和 `CloseSession` 要求 shell 维护映射或执行真实 IO。Core 不持有真实连接资源，只维护协议 session 和 core 分配的 `ConvId`。
 
 `SessionFrame` 位于 KCP reassembly 之后，只表达这条连接的 open、bytes、close、reset 和 keepalive，不重复定义可靠传输序列语义。
 
@@ -458,14 +463,14 @@ RayNet 不承诺历史兼容性。系统部署模型假设所有节点可以一�
 Entry endpoint：
 
 ```text
-ingress connector <-> EndpointCore
+ingress connector <-> shell session map <-> EndpointCore
 EndpointCore -> route plan -> transport channel -> EndpointCore
 ```
 
 Exit endpoint：
 
 ```text
-EndpointCore <-> exit connector
+EndpointCore <-> shell session map <-> exit connector
 EndpointCore -> route plan -> transport channel -> EndpointCore
 ```
 
@@ -477,6 +482,8 @@ ingress transport -> RelayCore -> egress transport
 
 入口可以由 socks5、HTTP CONNECT、透明代理或平台特定 ingress 提供目标信息；entry core 不绑定具体 ingress 语义。Exit 当前优先支持 TCP connect；后续可以加入 UDP associate 或其它 connector。
 
+同一个 relay mesh 可以同时服务多组 entry 和 exit。Relay 不理解 entry/exit 配对关系；它只验证 envelope、消费 route plan 并转发。当前模型里，一个 entry 的 `RouteTopology` 描述本 endpoint 的发送方向，并应收敛到一个明确的 exit；回程由该 exit 的反向 `RouteTopology` 指向对应 entry。因此一个 entry 在配置上基本绑定一个 exit。
+
 ## 16. 长期方向
 
 长期方向包括：
@@ -486,5 +493,6 @@ ingress transport -> RelayCore -> egress transport
 3. 更多 transport channel，包括更适合高延迟批量信道的 mailbox/file、HTTP polling、GitHub upload/download 等。
 4. 更成熟的 edge-state 和 route generation 策略，但不牺牲当前 core/shell 边界。
 5. 面向不同网络形态的可靠传输参数，例如低延迟交互、批量高延迟传输、弱连接恢复等。
+6. 多目标通信。未来可以评估让 `RouteTopology` 支持多个 destination endpoint，或在一个进程内运行多个不同 topology 的 endpoint core；当前不设计这部分，先保持一个 entry 配置对应一个明确 exit。
 
-这些方向不改变当前核心边界：core 是同步状态机，shell 负责运行时和 IO，relay 不理解 endpoint payload，endpoint 负责自己发送方向的 route-plan 调度。
+这些方向不改变当前核心边界：core 是同步状态机，shell 负责运行时和 IO，relay 不理解 endpoint message，endpoint 负责自己发送方向的 route-plan 调度。

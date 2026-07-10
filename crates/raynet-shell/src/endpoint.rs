@@ -1,5 +1,6 @@
 use aegis::aegis128l::Key;
 use log::{error, info};
+use rand::RngExt;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,27 +14,27 @@ use crate::local::{endpoint_from, send_core_actions};
 use crate::remote::{endpoint_in, forward_out};
 use crate::transport::OutboundTransportPacket;
 use crate::utils::now_millis;
-use raynet_core::{ChannelRouter, EndpointConfig, EndpointCore};
+use raynet_core::{EndpointConfig, EndpointCore, RouteChannel, RouteNode, RouteTopology};
 
 pub async fn run(
     listen_addr: SocketAddr,
     udp_socket: Arc<UdpSocket>,
     channels: Arc<UdpChannels>,
-    router: Arc<Mutex<ChannelRouter>>,
     key: Key,
 ) -> io::Result<Arc<RwLock<Connections>>> {
     let connections = Arc::new(RwLock::new(Connections::new()));
     let (ray_tx, ray_rx) = mpsc::channel::<OutboundTransportPacket>(65536);
+    let local_channels: Vec<_> = channels.channel_ids().collect();
+    let random_seed = rand::rng().random();
     let endpoint_core = Arc::new(Mutex::new(
         EndpointCore::new(EndpointConfig {
-            node_id: 1,
-            endpoint_id: 1,
-            hop_key: key,
-            endpoint_key: key,
-            default_destination_node_id: 2,
-            default_channel_plan: Vec::new(),
-            destination_routes: Vec::new(),
-            channels: channels.channel_configs(),
+            local_node_id: 1,
+            envelope_key: key,
+            message_key: key,
+            random_seed,
+            local_channels: local_channels.clone(),
+            route_topology: single_destination_topology(1, 2, &local_channels),
+            transport_mtu: 1200,
         })
         .expect("endpoint core config should be valid"),
     ));
@@ -41,19 +42,10 @@ pub async fn run(
     {
         let connections = connections.clone();
         let channels = channels.clone();
-        let router = router.clone();
         let endpoint_core = endpoint_core.clone();
         let ray_tx = ray_tx.clone();
         tokio::spawn(async move {
-            endpoint_in(
-                udp_socket,
-                connections,
-                channels,
-                router,
-                endpoint_core,
-                ray_tx,
-            )
-            .await;
+            endpoint_in(udp_socket, connections, channels, endpoint_core, ray_tx).await;
         });
     }
 
@@ -77,14 +69,12 @@ pub async fn run(
 
     {
         let channels = channels.clone();
-        let router = router.clone();
         let core_channels = channels.clone();
-        let core_router = router.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
                 tokio::spawn(async move {
-                    forward_out(ray_rx, core_channels, core_router).await;
+                    forward_out(ray_rx, core_channels).await;
                 });
                 let _ = tokio::signal::ctrl_c().await;
             });
@@ -118,5 +108,30 @@ async fn poll_endpoint_core(
             Ok(()) => send_core_actions(ray_tx.clone(), actions).await,
             Err(error) => error!("EndpointCore poll failed: {}", error),
         }
+    }
+}
+
+fn single_destination_topology(
+    local_node_id: u64,
+    destination_node_id: u64,
+    local_channels: &[u64],
+) -> RouteTopology {
+    RouteTopology {
+        nodes: vec![
+            RouteNode {
+                node_id: local_node_id,
+                channels: local_channels
+                    .iter()
+                    .map(|channel_id| RouteChannel {
+                        channel_id: *channel_id,
+                        peer_node_id: destination_node_id,
+                    })
+                    .collect(),
+            },
+            RouteNode {
+                node_id: destination_node_id,
+                channels: Vec::new(),
+            },
+        ],
     }
 }

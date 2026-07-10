@@ -1,5 +1,6 @@
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock, mpsc};
@@ -21,17 +22,16 @@ pub async fn endpoint_from(
             Ok((tcp_stream, src)) => {
                 let (tcp_read, tcp_write) = tcp_stream.into_split();
                 info!("New TCP connection: {}", src);
-                let local_connection_id = { connections.write().await.insert(src, tcp_write) };
-                emit_core_event(
+                connections.write().await.insert_pending(src, tcp_write);
+
+                emit_ingress_request(
+                    connections.clone(),
                     endpoint_core.clone(),
                     ray_tx.clone(),
-                    CoreEvent::IngressConnectionOpened {
-                        local_connection_id,
-                        target: Target {
-                            host: src.ip().to_string(),
-                            port: src.port(),
-                        },
-                        metadata: Metadata::new(),
+                    src,
+                    Target {
+                        host: src.ip().to_string(),
+                        port: src.port(),
                     },
                 )
                 .await;
@@ -45,11 +45,11 @@ pub async fn endpoint_from(
                         match tcp_read.try_read(&mut buf) {
                             Ok(0) => {
                                 info!("TCP connection closed: {}", src);
-                                emit_local_close(
+                                emit_session_close(
                                     connections.clone(),
                                     endpoint_core.clone(),
                                     ray_tx.clone(),
-                                    &src,
+                                    src,
                                     CloseReason::LocalClosed,
                                 )
                                 .await;
@@ -57,11 +57,11 @@ pub async fn endpoint_from(
                             }
                             Ok(len) => {
                                 debug!("Received {} bytes from TCP {}", len, src);
-                                emit_local_bytes(
+                                emit_session_bytes(
                                     connections.clone(),
                                     endpoint_core.clone(),
                                     ray_tx.clone(),
-                                    &src,
+                                    src,
                                     buf[..len].to_vec(),
                                 )
                                 .await;
@@ -71,11 +71,11 @@ pub async fn endpoint_from(
                             }
                             Err(e) => {
                                 error!("Failed to read from TCP stream: {}", e);
-                                emit_local_close(
+                                emit_session_close(
                                     connections.clone(),
                                     endpoint_core.clone(),
                                     ray_tx.clone(),
-                                    &src,
+                                    src,
                                     CloseReason::Error(e.to_string()),
                                 )
                                 .await;
@@ -83,7 +83,7 @@ pub async fn endpoint_from(
                             }
                         }
                     }
-                    connections.write().await.remove(&src);
+                    connections.write().await.remove_addr(&src);
                 });
             }
             Err(e) => error!("Failed to accept TCP connection: {}", e),
@@ -91,44 +91,63 @@ pub async fn endpoint_from(
     }
 }
 
-async fn emit_local_bytes(
+async fn emit_ingress_request(
     connections: Arc<RwLock<Connections>>,
     endpoint_core: Arc<Mutex<EndpointCore>>,
     ray_tx: mpsc::Sender<OutboundTransportPacket>,
-    src: &std::net::SocketAddr,
+    src: SocketAddr,
+    target: Target,
+) {
+    let mut actions = Vec::new();
+    let event = CoreEvent::IngressSessionRequested {
+        target,
+        metadata: Metadata::new(),
+    };
+    match endpoint_core
+        .lock()
+        .await
+        .handle_event(now_millis(), event, &mut actions)
+    {
+        Ok(()) => handle_ingress_actions(connections, ray_tx, src, actions).await,
+        Err(error) => {
+            error!("EndpointCore rejected ingress request: {}", error);
+            connections.write().await.remove_addr(&src);
+        }
+    }
+}
+
+async fn emit_session_bytes(
+    connections: Arc<RwLock<Connections>>,
+    endpoint_core: Arc<Mutex<EndpointCore>>,
+    ray_tx: mpsc::Sender<OutboundTransportPacket>,
+    src: SocketAddr,
     bytes: Vec<u8>,
 ) {
-    let Some(local_connection_id) = connections.read().await.local_connection_id(src) else {
+    let Some(conv_id) = connections.read().await.conv_id(&src) else {
         return;
     };
     emit_core_event(
         endpoint_core,
         ray_tx,
-        CoreEvent::LocalConnectionBytes {
-            local_connection_id,
-            bytes,
-        },
+        CoreEvent::SessionBytes { conv_id, bytes },
     )
     .await;
 }
 
-async fn emit_local_close(
+async fn emit_session_close(
     connections: Arc<RwLock<Connections>>,
     endpoint_core: Arc<Mutex<EndpointCore>>,
     ray_tx: mpsc::Sender<OutboundTransportPacket>,
-    src: &std::net::SocketAddr,
+    src: SocketAddr,
     reason: CloseReason,
 ) {
-    let Some(local_connection_id) = connections.read().await.local_connection_id(src) else {
+    let Some(conv_id) = connections.read().await.conv_id(&src) else {
         return;
     };
     emit_core_event(
         endpoint_core,
         ray_tx,
-        CoreEvent::LocalConnectionClosed {
-            local_connection_id,
-            reason,
-        },
+        CoreEvent::SessionClosed { conv_id, reason },
     )
     .await;
 }
@@ -149,21 +168,56 @@ async fn emit_core_event(
     }
 }
 
+async fn handle_ingress_actions(
+    connections: Arc<RwLock<Connections>>,
+    ray_tx: mpsc::Sender<OutboundTransportPacket>,
+    src: SocketAddr,
+    actions: Vec<CoreAction>,
+) {
+    for action in actions {
+        match action {
+            CoreAction::IngressSessionCreated { conv_id } => {
+                if !connections.write().await.bind_pending(src, conv_id) {
+                    warn!("No pending TCP connection for ingress conv {}", conv_id);
+                }
+            }
+            CoreAction::SendTransportPacket { channel_id, bytes } => {
+                send_transport_action(ray_tx.clone(), channel_id, bytes).await;
+            }
+            CoreAction::EmitMetric(_) | CoreAction::EmitEvent(_) => {}
+            CoreAction::OpenExitConnection { .. }
+            | CoreAction::WriteSession { .. }
+            | CoreAction::CloseSession { .. } => {
+                warn!("Unexpected endpoint core action while opening ingress")
+            }
+        }
+    }
+}
+
 pub(crate) async fn send_core_actions(
     ray_tx: mpsc::Sender<OutboundTransportPacket>,
     actions: Vec<CoreAction>,
 ) {
     for action in actions {
-        if let CoreAction::SendTransportPacket { channel_id, bytes } = action {
-            if let Err(error) = ray_tx
-                .send(OutboundTransportPacket {
-                    channel_id: Some(channel_id),
-                    bytes,
-                })
-                .await
-            {
-                error!("Failed to enqueue endpoint core packet: {}", error);
+        match action {
+            CoreAction::SendTransportPacket { channel_id, bytes } => {
+                send_transport_action(ray_tx.clone(), channel_id, bytes).await;
             }
+            CoreAction::EmitMetric(_) | CoreAction::EmitEvent(_) => {}
+            _ => warn!("Ignoring endpoint core action in local sender"),
         }
+    }
+}
+
+async fn send_transport_action(
+    ray_tx: mpsc::Sender<OutboundTransportPacket>,
+    channel_id: raynet_core::ChannelId,
+    bytes: Vec<u8>,
+) {
+    if let Err(error) = ray_tx
+        .send(OutboundTransportPacket { channel_id, bytes })
+        .await
+    {
+        error!("Failed to enqueue endpoint core packet: {}", error);
     }
 }

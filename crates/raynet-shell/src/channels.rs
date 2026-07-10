@@ -1,4 +1,4 @@
-use raynet_core::{ChannelConfig, ChannelId};
+use raynet_core::ChannelId;
 use std::net::{SocketAddr, ToSocketAddrs};
 
 #[derive(Debug, Clone)]
@@ -47,16 +47,5 @@ impl UdpChannels {
 
     pub fn channel_ids(&self) -> impl Iterator<Item = ChannelId> + '_ {
         self.channels.iter().map(|channel| channel.channel_id)
-    }
-
-    pub fn channel_configs(&self) -> Vec<ChannelConfig> {
-        self.channels
-            .iter()
-            .map(|channel| ChannelConfig {
-                channel_id: channel.channel_id,
-                peer_node_id: channel.channel_id,
-                mtu: 1200,
-            })
-            .collect()
     }
 }

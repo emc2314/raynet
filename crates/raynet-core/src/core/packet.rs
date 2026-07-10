@@ -1,13 +1,38 @@
 use aegis::aegis128l::{Aegis128L, Key, Nonce, Tag};
-use rand::RngExt;
 
 use crate::core::nonce::NonceFilter;
 
 const HEADER_SIZE: usize = 32;
 const MAX_PACKET_SIZE: usize = 64 * 1024 + HEADER_SIZE;
 
-pub fn seal_hop_payload(time_ms: u64, key: &Key, payload: &[u8]) -> Vec<u8> {
-    let nonce: Nonce = rand::rng().random();
+#[derive(Debug, Clone)]
+pub struct RandomStream {
+    key: [u8; 32],
+    counter: u64,
+}
+
+impl RandomStream {
+    pub fn new(seed: [u8; 16], label: &[u8]) -> Self {
+        let mut material = Vec::with_capacity(seed.len() + label.len());
+        material.extend_from_slice(&seed);
+        material.extend_from_slice(label);
+        Self {
+            key: blake3::derive_key("RayNet core random stream v1", &material),
+            counter: 0,
+        }
+    }
+
+    pub fn nonce(&mut self) -> Nonce {
+        let mut input = [0; 8];
+        input.copy_from_slice(&self.counter.to_le_bytes());
+        self.counter = self.counter.saturating_add(1);
+        blake3::keyed_hash(&self.key, &input).as_bytes()[0..16]
+            .try_into()
+            .expect("BLAKE3 output is at least 16 bytes")
+    }
+}
+
+pub fn seal_hop_payload(time_ms: u64, key: &Key, nonce: Nonce, payload: &[u8]) -> Vec<u8> {
     let cipher = Aegis128L::new(key, &nonce);
     let mut out = Vec::with_capacity(HEADER_SIZE + payload.len());
     out.extend_from_slice(&nonce);

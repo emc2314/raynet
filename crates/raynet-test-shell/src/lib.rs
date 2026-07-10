@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use raynet_core::{
-    ChannelConfig, ChannelId, ChannelState, CoreAction, CoreEvent, EndpointConfig, EndpointCore,
-    LocalConnectionId, Metadata, NodeId, RelayConfig, RelayCore, Target, TransportMetrics,
+    ChannelId, ChannelState, ConvId, CoreAction, CoreEvent, EndpointConfig, EndpointCore, Metadata,
+    NodeId, RelayConfig, RelayCore, RouteChannel, RouteNode, RouteTopology, Target,
+    TransportMetrics,
 };
 
 #[derive(Debug, Clone)]
@@ -37,7 +38,6 @@ pub struct TestShell {
     nodes: BTreeMap<NodeId, SimNode>,
     links: Vec<SimLink>,
     packets: Vec<ScheduledPacket>,
-    next_local_connection_id: LocalConnectionId,
     metrics: TestMetrics,
     delivered_by_outbound_channel: BTreeMap<(NodeId, ChannelId), u64>,
 }
@@ -45,7 +45,7 @@ pub struct TestShell {
 enum SimNode {
     Endpoint {
         core: EndpointCore,
-        local_connections: BTreeMap<LocalConnectionId, Vec<u8>>,
+        sessions: BTreeMap<ConvId, Vec<u8>>,
         echo_exit: bool,
     },
     Relay {
@@ -69,7 +69,6 @@ impl TestShell {
             nodes: BTreeMap::new(),
             links: Vec::new(),
             packets: Vec::new(),
-            next_local_connection_id: 1,
             metrics: TestMetrics::default(),
             delivered_by_outbound_channel: BTreeMap::new(),
         }
@@ -85,10 +84,10 @@ impl TestShell {
 
     pub fn add_endpoint(&mut self, config: EndpointConfig, echo_exit: bool) {
         self.nodes.insert(
-            config.node_id,
+            config.local_node_id,
             SimNode::Endpoint {
                 core: EndpointCore::new(config).expect("valid endpoint config"),
-                local_connections: BTreeMap::new(),
+                sessions: BTreeMap::new(),
                 echo_exit,
             },
         );
@@ -96,7 +95,7 @@ impl TestShell {
 
     pub fn add_relay(&mut self, config: RelayConfig) {
         self.nodes.insert(
-            config.node_id,
+            config.local_node_id,
             SimNode::Relay {
                 core: RelayCore::new(config).expect("valid relay config"),
             },
@@ -117,62 +116,64 @@ impl TestShell {
             queue_pressure: 0.0,
             send_error: state != ChannelState::Up,
         };
-        let event = CoreEvent::TransportChannelUpdated {
-            channel_id,
-            state,
-            metrics,
-        };
-        self.handle_event(node_id, event);
-    }
-
-    pub fn open_ingress(&mut self, node_id: NodeId, target: Target) -> LocalConnectionId {
-        let local_connection_id = self.alloc_local_connection_id();
-        if let Some(SimNode::Endpoint {
-            local_connections, ..
-        }) = self.nodes.get_mut(&node_id)
-        {
-            local_connections.insert(local_connection_id, Vec::new());
-        }
         self.handle_event(
             node_id,
-            CoreEvent::IngressConnectionOpened {
-                local_connection_id,
-                target,
-                metadata: Metadata::new(),
+            CoreEvent::TransportChannelUpdated {
+                channel_id,
+                state,
+                metrics,
             },
         );
-        local_connection_id
     }
 
-    pub fn send_local_bytes(
+    pub fn open_ingress(&mut self, node_id: NodeId, target: Target) -> ConvId {
+        let mut actions = Vec::new();
+        let result = match self.nodes.get_mut(&node_id) {
+            Some(SimNode::Endpoint { core, .. }) => core.handle_event(
+                self.now_ms,
+                CoreEvent::IngressSessionRequested {
+                    target,
+                    metadata: Metadata::new(),
+                },
+                &mut actions,
+            ),
+            _ => panic!("node {node_id} is not an endpoint"),
+        };
+        result.expect("ingress session opens");
+        let conv_id = actions
+            .iter()
+            .find_map(|action| match action {
+                CoreAction::IngressSessionCreated { conv_id } => Some(*conv_id),
+                _ => None,
+            })
+            .expect("core creates ingress session");
+        if let Some(SimNode::Endpoint { sessions, .. }) = self.nodes.get_mut(&node_id) {
+            sessions.insert(conv_id, Vec::new());
+        }
+        self.handle_actions(node_id, actions);
+        conv_id
+    }
+
+    pub fn send_session_bytes(
         &mut self,
         node_id: NodeId,
-        local_connection_id: LocalConnectionId,
+        conv_id: ConvId,
         bytes: impl Into<Vec<u8>>,
     ) {
         self.handle_event(
             node_id,
-            CoreEvent::LocalConnectionBytes {
-                local_connection_id,
+            CoreEvent::SessionBytes {
+                conv_id,
                 bytes: bytes.into(),
             },
         );
     }
 
-    pub fn local_bytes(
-        &self,
-        node_id: NodeId,
-        local_connection_id: LocalConnectionId,
-    ) -> Option<&[u8]> {
-        let Some(SimNode::Endpoint {
-            local_connections, ..
-        }) = self.nodes.get(&node_id)
-        else {
+    pub fn session_bytes(&self, node_id: NodeId, conv_id: ConvId) -> Option<&[u8]> {
+        let Some(SimNode::Endpoint { sessions, .. }) = self.nodes.get(&node_id) else {
             return None;
         };
-        local_connections
-            .get(&local_connection_id)
-            .map(Vec::as_slice)
+        sessions.get(&conv_id).map(Vec::as_slice)
     }
 
     pub fn delivered_on(&self, node_id: NodeId, channel_id: ChannelId) -> u64 {
@@ -242,62 +243,42 @@ impl TestShell {
                 CoreAction::SendTransportPacket { channel_id, bytes } => {
                     self.send_transport(node_id, channel_id, bytes);
                 }
+                CoreAction::IngressSessionCreated { conv_id } => {
+                    if let Some(SimNode::Endpoint { sessions, .. }) = self.nodes.get_mut(&node_id) {
+                        sessions.entry(conv_id).or_default();
+                    }
+                }
                 CoreAction::OpenExitConnection {
-                    stream_id, target, ..
+                    conv_id, target, ..
                 } => {
-                    let local_connection_id = self.alloc_local_connection_id();
-                    if let Some(SimNode::Endpoint {
-                        local_connections, ..
-                    }) = self.nodes.get_mut(&node_id)
-                    {
-                        local_connections.insert(local_connection_id, Vec::new());
+                    if let Some(SimNode::Endpoint { sessions, .. }) = self.nodes.get_mut(&node_id) {
+                        sessions.entry(conv_id).or_default();
                     }
                     let _ = target;
-                    self.handle_event(
-                        node_id,
-                        CoreEvent::ExitConnectionOpened {
-                            stream_id,
-                            local_connection_id,
-                        },
-                    );
+                    self.handle_event(node_id, CoreEvent::ExitConnectionOpened { conv_id });
                 }
-                CoreAction::WriteLocalConnection {
-                    local_connection_id,
-                    bytes,
-                } => self.write_local_connection(node_id, local_connection_id, bytes),
-                CoreAction::CloseLocalConnection {
-                    local_connection_id,
-                    reason,
-                } => {
-                    if let Some(SimNode::Endpoint {
-                        local_connections, ..
-                    }) = self.nodes.get_mut(&node_id)
-                    {
-                        let _ = reason;
-                        local_connections.remove(&local_connection_id);
+                CoreAction::WriteSession { conv_id, bytes } => {
+                    self.write_session(node_id, conv_id, bytes);
+                }
+                CoreAction::CloseSession { conv_id, .. } => {
+                    if let Some(SimNode::Endpoint { sessions, .. }) = self.nodes.get_mut(&node_id) {
+                        sessions.remove(&conv_id);
                     }
                 }
-                CoreAction::CloseRemoteStream { .. }
-                | CoreAction::EmitMetric(_)
-                | CoreAction::EmitLog { .. } => {}
+                CoreAction::EmitMetric(_) | CoreAction::EmitEvent(_) => {}
             }
         }
     }
 
-    fn write_local_connection(
-        &mut self,
-        node_id: NodeId,
-        local_connection_id: LocalConnectionId,
-        bytes: Vec<u8>,
-    ) {
+    fn write_session(&mut self, node_id: NodeId, conv_id: ConvId, bytes: Vec<u8>) {
         let echo_exit = match self.nodes.get_mut(&node_id) {
             Some(SimNode::Endpoint {
-                local_connections,
+                sessions,
                 echo_exit,
                 ..
             }) => {
-                local_connections
-                    .entry(local_connection_id)
+                sessions
+                    .entry(conv_id)
                     .or_default()
                     .extend_from_slice(&bytes);
                 *echo_exit
@@ -306,13 +287,7 @@ impl TestShell {
         };
 
         if echo_exit {
-            self.handle_event(
-                node_id,
-                CoreEvent::LocalConnectionBytes {
-                    local_connection_id,
-                    bytes,
-                },
-            );
+            self.handle_event(node_id, CoreEvent::SessionBytes { conv_id, bytes });
         } else {
             self.metrics.delivered_local_bytes = self
                 .metrics
@@ -399,12 +374,6 @@ impl TestShell {
             self.handle_actions(node_id, actions);
         }
     }
-
-    fn alloc_local_connection_id(&mut self) -> LocalConnectionId {
-        let id = self.next_local_connection_id;
-        self.next_local_connection_id = self.next_local_connection_id.saturating_add(1).max(1);
-        id
-    }
 }
 
 impl Default for TestShell {
@@ -426,52 +395,94 @@ impl SimLink {
     }
 }
 
-pub fn channel(channel_id: ChannelId, peer_node_id: NodeId) -> ChannelConfig {
-    ChannelConfig {
+pub fn route_channel(channel_id: ChannelId, peer_node_id: NodeId) -> RouteChannel {
+    RouteChannel {
         channel_id,
         peer_node_id,
-        mtu: 1200,
+    }
+}
+
+pub fn topology(nodes: Vec<(NodeId, Vec<RouteChannel>)>) -> RouteTopology {
+    RouteTopology {
+        nodes: nodes
+            .into_iter()
+            .map(|(node_id, channels)| RouteNode { node_id, channels })
+            .collect(),
+    }
+}
+
+pub fn endpoint_config(
+    local_node_id: NodeId,
+    envelope_key: [u8; 16],
+    message_key: [u8; 16],
+    random_seed: [u8; 16],
+    local_channels: Vec<ChannelId>,
+    route_topology: RouteTopology,
+) -> EndpointConfig {
+    EndpointConfig {
+        local_node_id,
+        envelope_key,
+        message_key,
+        random_seed,
+        local_channels,
+        route_topology,
+        transport_mtu: 1200,
+    }
+}
+
+pub fn relay_config(
+    local_node_id: NodeId,
+    envelope_key: [u8; 16],
+    random_seed: [u8; 16],
+    local_channels: Vec<ChannelId>,
+) -> RelayConfig {
+    RelayConfig {
+        local_node_id,
+        envelope_key,
+        random_seed,
+        local_channels,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raynet_core::{DestinationRoute, EndpointConfig, RelayConfig};
+
+    const ENVELOPE_KEY: [u8; 16] = [5; 16];
+    const MESSAGE_KEY: [u8; 16] = [7; 16];
 
     #[test]
     fn test_shell_delivers_echo_through_relay_with_virtual_time() {
         let mut shell = TestShell::new();
         shell.add_endpoint(
-            EndpointConfig {
-                node_id: 1,
-                endpoint_id: 1,
-                hop_key: [5; 16],
-                endpoint_key: [7; 16],
-                default_destination_node_id: 3,
-                default_channel_plan: vec![11, 21],
-                destination_routes: Vec::new(),
-                channels: vec![channel(11, 2)],
-            },
+            endpoint_config(
+                1,
+                ENVELOPE_KEY,
+                MESSAGE_KEY,
+                [1; 16],
+                vec![11],
+                topology(vec![
+                    (1, vec![route_channel(11, 2)]),
+                    (2, vec![route_channel(21, 3)]),
+                    (3, Vec::new()),
+                ]),
+            ),
             false,
         );
-        shell.add_relay(RelayConfig {
-            node_id: 2,
-            hop_key: [5; 16],
-            destination_routes: Vec::new(),
-            channels: vec![channel(21, 3), channel(22, 1)],
-        });
+        shell.add_relay(relay_config(2, ENVELOPE_KEY, [2; 16], vec![21, 22]));
         shell.add_endpoint(
-            EndpointConfig {
-                node_id: 3,
-                endpoint_id: 1,
-                hop_key: [5; 16],
-                endpoint_key: [7; 16],
-                default_destination_node_id: 1,
-                default_channel_plan: vec![31, 22],
-                destination_routes: Vec::new(),
-                channels: vec![channel(31, 2)],
-            },
+            endpoint_config(
+                3,
+                ENVELOPE_KEY,
+                MESSAGE_KEY,
+                [3; 16],
+                vec![31],
+                topology(vec![
+                    (3, vec![route_channel(31, 2)]),
+                    (2, vec![route_channel(22, 1)]),
+                    (1, Vec::new()),
+                ]),
+            ),
             true,
         );
         shell.add_link(link(1, 11, 2, 201, 10, 100));
@@ -479,7 +490,7 @@ mod tests {
         shell.add_link(link(3, 31, 2, 202, 30, 100));
         shell.add_link(link(2, 22, 1, 101, 40, 100));
 
-        let local_id = shell.open_ingress(
+        let conv_id = shell.open_ingress(
             1,
             Target {
                 host: "echo.invalid".to_string(),
@@ -487,10 +498,10 @@ mod tests {
             },
         );
         shell.run_until_idle(16);
-        shell.send_local_bytes(1, local_id, b"hello".to_vec());
-        shell.run_until_idle(64);
+        shell.send_session_bytes(1, conv_id, b"hello".to_vec());
+        shell.run_until_idle(128);
 
-        assert_eq!(shell.local_bytes(1, local_id), Some(&b"hello"[..]));
+        assert_eq!(shell.session_bytes(1, conv_id), Some(&b"hello"[..]));
         assert_eq!(shell.metrics().delivered_local_bytes, 5);
         assert!(shell.metrics().last_delivery_ms >= 100);
     }
@@ -498,15 +509,7 @@ mod tests {
     #[test]
     fn test_shell_tracks_loss_and_temporary_disconnect() {
         let mut shell = TestShell::new();
-        shell.add_relay(RelayConfig {
-            node_id: 2,
-            hop_key: [5; 16],
-            destination_routes: vec![DestinationRoute {
-                destination_node_id: 9,
-                channel_ids: vec![21, 22],
-            }],
-            channels: vec![channel(21, 9), channel(22, 9)],
-        });
+        shell.add_relay(relay_config(2, ENVELOPE_KEY, [2; 16], vec![21, 22]));
         shell.add_link(SimLink {
             from_node: 2,
             from_channel_id: 21,
@@ -541,50 +544,40 @@ mod tests {
     }
 
     #[test]
-    fn test_shell_routes_around_down_relay_channel_end_to_end() {
+    fn test_shell_uses_full_route_plan_for_relay_hops() {
         let mut shell = TestShell::new();
         shell.add_endpoint(
-            EndpointConfig {
-                node_id: 1,
-                endpoint_id: 11,
-                hop_key: [5; 16],
-                endpoint_key: [11; 16],
-                default_destination_node_id: 3,
-                default_channel_plan: vec![11],
-                destination_routes: Vec::new(),
-                channels: vec![channel(11, 2)],
-            },
+            endpoint_config(
+                1,
+                ENVELOPE_KEY,
+                MESSAGE_KEY,
+                [4; 16],
+                vec![11],
+                topology(vec![
+                    (1, vec![route_channel(11, 2)]),
+                    (2, vec![route_channel(22, 3)]),
+                    (3, Vec::new()),
+                ]),
+            ),
             false,
         );
-        shell.add_relay(RelayConfig {
-            node_id: 2,
-            hop_key: [5; 16],
-            destination_routes: vec![DestinationRoute {
-                destination_node_id: 3,
-                channel_ids: vec![21, 22],
-            }],
-            channels: vec![channel(21, 3), channel(22, 3)],
-        });
+        shell.add_relay(relay_config(2, ENVELOPE_KEY, [2; 16], vec![21, 22]));
         shell.add_endpoint(
-            EndpointConfig {
-                node_id: 3,
-                endpoint_id: 11,
-                hop_key: [5; 16],
-                endpoint_key: [11; 16],
-                default_destination_node_id: 1,
-                default_channel_plan: vec![31],
-                destination_routes: Vec::new(),
-                channels: vec![channel(31, 1)],
-            },
+            endpoint_config(
+                3,
+                ENVELOPE_KEY,
+                MESSAGE_KEY,
+                [5; 16],
+                vec![31],
+                topology(vec![(3, vec![route_channel(31, 1)]), (1, Vec::new())]),
+            ),
             true,
         );
         shell.add_link(link(1, 11, 2, 201, 5, 100));
-        shell.add_link(link(2, 21, 3, 301, 5, 100));
         shell.add_link(link(2, 22, 3, 302, 35, 100));
         shell.add_link(link(3, 31, 1, 101, 5, 100));
-        shell.set_channel_state(2, 21, ChannelState::Down);
 
-        let local_id = shell.open_ingress(
+        let conv_id = shell.open_ingress(
             1,
             Target {
                 host: "echo.invalid".to_string(),
@@ -592,10 +585,10 @@ mod tests {
             },
         );
         shell.run_until_idle(64);
-        shell.send_local_bytes(1, local_id, b"route".to_vec());
+        shell.send_session_bytes(1, conv_id, b"route".to_vec());
         shell.run_until_idle(128);
 
-        assert_eq!(shell.local_bytes(1, local_id), Some(&b"route"[..]));
+        assert_eq!(shell.session_bytes(1, conv_id), Some(&b"route"[..]));
         assert_eq!(shell.delivered_on(2, 21), 0);
         assert!(shell.delivered_on(2, 22) > 0);
     }
@@ -604,29 +597,25 @@ mod tests {
     fn test_shell_retransmits_with_virtual_time_after_disconnect() {
         let mut shell = TestShell::new();
         shell.add_endpoint(
-            EndpointConfig {
-                node_id: 1,
-                endpoint_id: 7,
-                hop_key: [5; 16],
-                endpoint_key: [9; 16],
-                default_destination_node_id: 2,
-                default_channel_plan: vec![11],
-                destination_routes: Vec::new(),
-                channels: vec![channel(11, 2)],
-            },
+            endpoint_config(
+                1,
+                ENVELOPE_KEY,
+                [9; 16],
+                [6; 16],
+                vec![11],
+                topology(vec![(1, vec![route_channel(11, 2)]), (2, Vec::new())]),
+            ),
             false,
         );
         shell.add_endpoint(
-            EndpointConfig {
-                node_id: 2,
-                endpoint_id: 7,
-                hop_key: [5; 16],
-                endpoint_key: [9; 16],
-                default_destination_node_id: 1,
-                default_channel_plan: vec![21],
-                destination_routes: Vec::new(),
-                channels: vec![channel(21, 1)],
-            },
+            endpoint_config(
+                2,
+                ENVELOPE_KEY,
+                [9; 16],
+                [7; 16],
+                vec![21],
+                topology(vec![(2, vec![route_channel(21, 1)]), (1, Vec::new())]),
+            ),
             true,
         );
         shell.add_link(SimLink {
@@ -644,7 +633,7 @@ mod tests {
         });
         shell.add_link(link(2, 21, 1, 11, 5, 100));
 
-        let local_id = shell.open_ingress(
+        let conv_id = shell.open_ingress(
             1,
             Target {
                 host: "echo.invalid".to_string(),
@@ -652,10 +641,10 @@ mod tests {
             },
         );
         shell.run_until_idle(128);
-        shell.send_local_bytes(1, local_id, b"retry".to_vec());
+        shell.send_session_bytes(1, conv_id, b"retry".to_vec());
         shell.run_until_idle(128);
 
-        assert_eq!(shell.local_bytes(1, local_id), Some(&b"retry"[..]));
+        assert_eq!(shell.session_bytes(1, conv_id), Some(&b"retry"[..]));
         assert!(shell.metrics().dropped_packets > 0);
         assert!(shell.now_ms() >= 55);
     }

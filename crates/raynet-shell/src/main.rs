@@ -18,8 +18,6 @@ mod transport;
 mod utils;
 
 use channels::UdpChannels;
-use raynet_core::ChannelRouter;
-use tokio::sync::Mutex;
 
 use mimalloc::MiMalloc;
 #[global_allocator]
@@ -81,7 +79,6 @@ async fn main() -> io::Result<()> {
             .or(file_config.send)
             .unwrap_or_else(|| vec!["[::1]:8443".to_string()]),
     ));
-    let router = Arc::new(Mutex::new(ChannelRouter::new(channels.channel_ids())));
     let key = blake3::derive_key(
         "RayNet PSK v1",
         cli.key
@@ -95,10 +92,10 @@ async fn main() -> io::Result<()> {
     let udp_socket = Arc::new(UdpSocket::bind(listen_addr).await?);
 
     let connections = if !endpoint {
-        relay::run(udp_socket, channels, router, key).await?;
+        relay::run(udp_socket, channels, key).await?;
         None
     } else {
-        Some(endpoint::run(listen_addr, udp_socket, channels, router, key).await?)
+        Some(endpoint::run(listen_addr, udp_socket, channels, key).await?)
     };
 
     tokio::signal::ctrl_c().await?;

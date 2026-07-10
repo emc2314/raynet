@@ -1,55 +1,27 @@
-use crate::{ChannelId, CloseReason, Metadata, NodeId, StreamId, Target};
+use crate::{CloseReason, Metadata, Target};
 
 const ENVELOPE_MAGIC: &[u8; 4] = b"RNE1";
-const ENDPOINT_FRAME_MAGIC: &[u8; 4] = b"RNF1";
+const SESSION_FRAME_MAGIC: &[u8; 4] = b"RNF1";
 const MAX_ENVELOPE_SIZE: usize = 64 * 1024;
-const MAX_ENDPOINT_FRAME_SIZE: usize = 64 * 1024;
-const MAX_PLAN_LEN: usize = 64;
-const MAX_TRACE_LEN: usize = 64;
+const MAX_SESSION_FRAME_SIZE: usize = 64 * 1024;
+const MAX_ROUTE_PLAN_LEN: usize = 64;
 const MAX_METADATA_ITEMS: usize = 64;
 const MAX_STRING_LEN: usize = 4096;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PacketType {
-    Data,
-    Control,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TraceEntry {
-    pub node_id: NodeId,
-    pub channel_id: ChannelId,
-}
+pub type RoutePlan = Vec<crate::ChannelId>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Envelope {
-    pub packet_type: PacketType,
-    pub source_node_id: NodeId,
-    pub destination_node_id: NodeId,
-    pub channel_plan: Vec<ChannelId>,
-    pub return_trace: Vec<TraceEntry>,
+    pub route_plan: RoutePlan,
     pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EndpointFrame {
-    OpenStream {
-        stream_id: StreamId,
-        target: Target,
-        metadata: Metadata,
-    },
-    StreamBytes {
-        stream_id: StreamId,
-        bytes: Vec<u8>,
-    },
-    CloseStream {
-        stream_id: StreamId,
-        reason: CloseReason,
-    },
-    ResetStream {
-        stream_id: StreamId,
-        reason: CloseReason,
-    },
+pub enum SessionFrame {
+    OpenConnection { target: Target, metadata: Metadata },
+    ConnectionBytes { bytes: Vec<u8> },
+    CloseConnection { reason: CloseReason },
+    ResetConnection { reason: CloseReason },
     KeepAlive,
 }
 
@@ -61,8 +33,6 @@ pub enum WireError {
     TooLarge,
     #[error("invalid magic")]
     InvalidMagic,
-    #[error("invalid packet type {0}")]
-    InvalidPacketType(u8),
     #[error("invalid frame type {0}")]
     InvalidFrameType(u8),
     #[error("declared length exceeds buffer")]
@@ -75,33 +45,19 @@ pub enum WireError {
 
 impl Envelope {
     pub fn encode(&self) -> Result<Vec<u8>, WireError> {
-        if self.channel_plan.len() > MAX_PLAN_LEN || self.return_trace.len() > MAX_TRACE_LEN {
+        if self.route_plan.len() > MAX_ROUTE_PLAN_LEN {
             return Err(WireError::CountOutOfBounds);
         }
         if self.payload.len() > MAX_ENVELOPE_SIZE {
             return Err(WireError::TooLarge);
         }
 
-        let mut out = Vec::with_capacity(
-            32 + self.channel_plan.len() * 8 + self.return_trace.len() * 16 + self.payload.len(),
-        );
+        let mut out = Vec::with_capacity(10 + self.route_plan.len() * 8 + self.payload.len());
         out.extend_from_slice(ENVELOPE_MAGIC);
-        out.push(match self.packet_type {
-            PacketType::Data => 0,
-            PacketType::Control => 1,
-        });
-        put_u64(&mut out, self.source_node_id);
-        put_u64(&mut out, self.destination_node_id);
-        put_u16(&mut out, self.channel_plan.len() as u16);
-        put_u16(&mut out, self.return_trace.len() as u16);
+        put_u16(&mut out, self.route_plan.len() as u16);
         put_u32(&mut out, self.payload.len() as u32);
-
-        for channel_id in &self.channel_plan {
+        for channel_id in &self.route_plan {
             put_u64(&mut out, *channel_id);
-        }
-        for entry in &self.return_trace {
-            put_u64(&mut out, entry.node_id);
-            put_u64(&mut out, entry.channel_id);
         }
         out.extend_from_slice(&self.payload);
         Ok(out)
@@ -116,126 +72,91 @@ impl Envelope {
         if cursor.take(4)? != ENVELOPE_MAGIC {
             return Err(WireError::InvalidMagic);
         }
-        let packet_type = match cursor.u8()? {
-            0 => PacketType::Data,
-            1 => PacketType::Control,
-            value => return Err(WireError::InvalidPacketType(value)),
-        };
-        let source_node_id = cursor.u64()?;
-        let destination_node_id = cursor.u64()?;
-        let plan_len = cursor.u16()? as usize;
-        let trace_len = cursor.u16()? as usize;
+        let route_plan_len = cursor.u16()? as usize;
         let payload_len = cursor.u32()? as usize;
 
-        if plan_len > MAX_PLAN_LEN || trace_len > MAX_TRACE_LEN {
+        if route_plan_len > MAX_ROUTE_PLAN_LEN {
             return Err(WireError::CountOutOfBounds);
         }
 
-        let mut channel_plan = Vec::with_capacity(plan_len);
-        for _ in 0..plan_len {
-            channel_plan.push(cursor.u64()?);
-        }
-
-        let mut return_trace = Vec::with_capacity(trace_len);
-        for _ in 0..trace_len {
-            return_trace.push(TraceEntry {
-                node_id: cursor.u64()?,
-                channel_id: cursor.u64()?,
-            });
+        let mut route_plan = Vec::with_capacity(route_plan_len);
+        for _ in 0..route_plan_len {
+            route_plan.push(cursor.u64()?);
         }
 
         let payload = cursor.take(payload_len)?.to_vec();
         cursor.finish()?;
 
         Ok(Self {
-            packet_type,
-            source_node_id,
-            destination_node_id,
-            channel_plan,
-            return_trace,
+            route_plan,
             payload,
         })
     }
 }
 
-impl EndpointFrame {
+impl SessionFrame {
     pub fn encode(&self) -> Result<Vec<u8>, WireError> {
         let mut out = Vec::new();
-        out.extend_from_slice(ENDPOINT_FRAME_MAGIC);
+        out.extend_from_slice(SESSION_FRAME_MAGIC);
 
         match self {
-            EndpointFrame::OpenStream {
-                stream_id,
-                target,
-                metadata,
-            } => {
+            SessionFrame::OpenConnection { target, metadata } => {
                 out.push(0);
-                put_u64(&mut out, *stream_id);
                 put_string(&mut out, &target.host)?;
                 put_u16(&mut out, target.port);
                 put_metadata(&mut out, metadata)?;
             }
-            EndpointFrame::StreamBytes { stream_id, bytes } => {
+            SessionFrame::ConnectionBytes { bytes } => {
                 out.push(1);
-                put_u64(&mut out, *stream_id);
                 put_bytes(&mut out, bytes)?;
             }
-            EndpointFrame::CloseStream { stream_id, reason } => {
+            SessionFrame::CloseConnection { reason } => {
                 out.push(2);
-                put_u64(&mut out, *stream_id);
                 put_close_reason(&mut out, reason)?;
             }
-            EndpointFrame::ResetStream { stream_id, reason } => {
+            SessionFrame::ResetConnection { reason } => {
                 out.push(3);
-                put_u64(&mut out, *stream_id);
                 put_close_reason(&mut out, reason)?;
             }
-            EndpointFrame::KeepAlive => {
-                out.push(4);
-            }
+            SessionFrame::KeepAlive => out.push(4),
         }
 
-        if out.len() > MAX_ENDPOINT_FRAME_SIZE {
+        if out.len() > MAX_SESSION_FRAME_SIZE {
             return Err(WireError::TooLarge);
         }
         Ok(out)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
-        if bytes.len() > MAX_ENDPOINT_FRAME_SIZE {
+        if bytes.len() > MAX_SESSION_FRAME_SIZE {
             return Err(WireError::TooLarge);
         }
 
         let mut cursor = Cursor::new(bytes);
-        if cursor.take(4)? != ENDPOINT_FRAME_MAGIC {
+        if cursor.take(4)? != SESSION_FRAME_MAGIC {
             return Err(WireError::InvalidMagic);
         }
 
         let frame = match cursor.u8()? {
             0 => {
-                let stream_id = cursor.u64()?;
                 let host = cursor.string()?;
                 let port = cursor.u16()?;
                 let metadata = cursor.metadata()?;
-                EndpointFrame::OpenStream {
-                    stream_id,
+                SessionFrame::OpenConnection {
                     target: Target { host, port },
                     metadata,
                 }
             }
-            1 => EndpointFrame::StreamBytes {
-                stream_id: cursor.u64()?,
+            1 => SessionFrame::ConnectionBytes {
                 bytes: cursor.bytes()?,
             },
-            2 => EndpointFrame::CloseStream {
-                stream_id: cursor.u64()?,
+            2 => SessionFrame::CloseConnection {
                 reason: cursor.close_reason()?,
             },
-            3 => EndpointFrame::ResetStream {
-                stream_id: cursor.u64()?,
+            3 => SessionFrame::ResetConnection {
                 reason: cursor.close_reason()?,
             },
-            4 => EndpointFrame::KeepAlive,
+            4 => SessionFrame::KeepAlive,
             value => return Err(WireError::InvalidFrameType(value)),
         };
         cursor.finish()?;
@@ -395,16 +316,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn envelope_roundtrips_channel_plan_trace_and_payload() {
+    fn envelope_roundtrips_route_plan_and_payload() {
         let envelope = Envelope {
-            packet_type: PacketType::Data,
-            source_node_id: 1,
-            destination_node_id: 9,
-            channel_plan: vec![2, 3],
-            return_trace: vec![TraceEntry {
-                node_id: 4,
-                channel_id: 5,
-            }],
+            route_plan: vec![2, 3],
             payload: b"payload".to_vec(),
         };
 
@@ -415,11 +329,10 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_frame_roundtrips_open_stream() {
+    fn session_frame_roundtrips_open_connection() {
         let mut metadata = Metadata::new();
         metadata.insert("proto".to_string(), "tcp".to_string());
-        let frame = EndpointFrame::OpenStream {
-            stream_id: 7,
+        let frame = SessionFrame::OpenConnection {
             target: Target {
                 host: "example.com".to_string(),
                 port: 443,
@@ -428,7 +341,7 @@ mod tests {
         };
 
         let encoded = frame.encode().unwrap();
-        let decoded = EndpointFrame::decode(&encoded).unwrap();
+        let decoded = SessionFrame::decode(&encoded).unwrap();
 
         assert_eq!(decoded, frame);
     }
