@@ -1,137 +1,91 @@
 use aegis::aegis128l::Key;
-use log::{error, info};
+use log::info;
 use rand::RngExt;
-use std::io;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{Mutex, RwLock, mpsc};
-use tokio::time::{Duration, sleep};
+use tokio::sync::{Mutex, mpsc};
 
-use crate::channels::UdpChannels;
-use crate::connections::Connections;
-use crate::local::{endpoint_from, send_core_actions};
-use crate::remote::{endpoint_in, forward_out};
+use crate::channels::{ChannelSenders, InboundTransportPacket};
+use crate::remote::{EndpointRuntime, forward_out};
 use crate::transport::OutboundTransportPacket;
-use crate::utils::now_millis;
-use raynet_core::{EndpointConfig, EndpointCore, RouteChannel, RouteNode, RouteTopology};
+use crate::utils::CoreClock;
+use raynet_core::{
+    EndpointConfig, EndpointCore, KcpConfig, RouteConfig, RouteEdge, RouteGraph, RouteNode,
+};
+use raynet_shell_plugins::{ProxyListener, ProxyPlugin};
 
-pub async fn run(
-    listen_addr: SocketAddr,
-    udp_socket: Arc<UdpSocket>,
-    channels: Arc<UdpChannels>,
-    key: Key,
-) -> io::Result<Arc<RwLock<Connections>>> {
-    let connections = Arc::new(RwLock::new(Connections::new()));
+pub fn run(
+    channels: Arc<ChannelSenders>,
+    channel_receiver: mpsc::Receiver<InboundTransportPacket>,
+    envelope_key: Key,
+    message_key: Key,
+    route: Option<RouteGraph>,
+    mut proxy_listener: ProxyListener,
+    proxy: Arc<dyn ProxyPlugin>,
+) {
+    let clock = Arc::new(CoreClock::new());
     let (ray_tx, ray_rx) = mpsc::channel::<OutboundTransportPacket>(65536);
-    let local_channels: Vec<_> = channels.channel_ids().collect();
+    let local_channels = channels.channel_ids();
     let random_seed = rand::rng().random();
-    let endpoint_core = Arc::new(Mutex::new(
-        EndpointCore::new(EndpointConfig {
-            local_node_id: 1,
-            envelope_key: key,
-            message_key: key,
-            random_seed,
-            local_channels: local_channels.clone(),
-            route_topology: single_destination_topology(1, 2, &local_channels),
-            transport_mtu: 1200,
+    let endpoint_core = Arc::new(Mutex::new(EndpointCore::new(EndpointConfig {
+        envelope_key,
+        message_key,
+        random_seed,
+        boot_time_ms: clock.boot_time_ms(),
+        kcp: KcpConfig::default(),
+        local_channels: local_channels.clone(),
+        route: RouteConfig {
+            graph: route_graph(&local_channels, route),
+            min_mtu: 1200,
+            feedback_interval_ms: 1_000,
+            feedback_timeout_ms: 5_000,
+        },
+        padding_reserve: 128,
+        keepalive_interval_ms: 0,
+    })));
+
+    let runtime = EndpointRuntime::new(proxy, endpoint_core, ray_tx, clock);
+    tokio::spawn(runtime.clone().receive_packets(channel_receiver));
+    let local_runtime = runtime.clone();
+    tokio::spawn(async move {
+        while let Some(session) = proxy_listener.accept().await {
+            local_runtime.open(session).await;
+        }
+    });
+    tokio::spawn(runtime.clone().poll());
+
+    tokio::spawn(async move {
+        forward_out(ray_rx, channels, move |packet| {
+            let runtime = runtime.clone();
+            async move { runtime.send_failed(packet).await }
         })
-        .expect("endpoint core config should be valid"),
-    ));
-
-    {
-        let connections = connections.clone();
-        let channels = channels.clone();
-        let endpoint_core = endpoint_core.clone();
-        let ray_tx = ray_tx.clone();
-        tokio::spawn(async move {
-            endpoint_in(udp_socket, connections, channels, endpoint_core, ray_tx).await;
-        });
-    }
-
-    {
-        let tcp_listener = TcpListener::bind(listen_addr).await?;
-        let connections = connections.clone();
-        let endpoint_core = endpoint_core.clone();
-        let ray_tx = ray_tx.clone();
-        tokio::spawn(async move {
-            endpoint_from(tcp_listener, connections, endpoint_core, ray_tx).await;
-        });
-    }
-
-    {
-        let endpoint_core = endpoint_core.clone();
-        let ray_tx = ray_tx.clone();
-        tokio::spawn(async move {
-            poll_endpoint_core(endpoint_core, ray_tx).await;
-        });
-    }
-
-    {
-        let channels = channels.clone();
-        let core_channels = channels.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async move {
-                tokio::spawn(async move {
-                    forward_out(ray_rx, core_channels).await;
-                });
-                let _ = tokio::signal::ctrl_c().await;
-            });
-        });
-    }
+        .await;
+    });
 
     info!("Started RayNet Endpoint");
-    Ok(connections)
 }
 
-async fn poll_endpoint_core(
-    endpoint_core: Arc<Mutex<EndpointCore>>,
-    ray_tx: mpsc::Sender<OutboundTransportPacket>,
-) {
-    loop {
-        let now = now_millis();
-        let deadline = endpoint_core.lock().await.next_deadline(now);
-        let Some(deadline) = deadline else {
-            sleep(Duration::from_millis(20)).await;
-            continue;
-        };
-
-        if deadline > now {
-            sleep(Duration::from_millis((deadline - now).min(100))).await;
-            continue;
-        }
-
-        let mut actions = Vec::new();
-        let result = { endpoint_core.lock().await.poll(now_millis(), &mut actions) };
-        match result {
-            Ok(()) => send_core_actions(ray_tx.clone(), actions).await,
-            Err(error) => error!("EndpointCore poll failed: {}", error),
-        }
-    }
-}
-
-fn single_destination_topology(
-    local_node_id: u64,
-    destination_node_id: u64,
-    local_channels: &[u64],
-) -> RouteTopology {
-    RouteTopology {
+fn route_graph(local_channels: &[raynet_core::ChannelId], route: Option<RouteGraph>) -> RouteGraph {
+    let graph = route.unwrap_or_else(|| RouteGraph {
         nodes: vec![
             RouteNode {
-                node_id: local_node_id,
-                channels: local_channels
+                edges: local_channels
                     .iter()
-                    .map(|channel_id| RouteChannel {
+                    .map(|channel_id| RouteEdge {
                         channel_id: *channel_id,
-                        peer_node_id: destination_node_id,
+                        next: 1,
+                        capacity_hint_kbps: 0,
+                        latency_hint_ms: 0,
                     })
                     .collect(),
             },
-            RouteNode {
-                node_id: destination_node_id,
-                channels: Vec::new(),
-            },
+            RouteNode { edges: Vec::new() },
         ],
-    }
+    });
+    assert!(
+        graph.nodes[0]
+            .edges
+            .iter()
+            .all(|edge| local_channels.contains(&edge.channel_id))
+    );
+    graph
 }

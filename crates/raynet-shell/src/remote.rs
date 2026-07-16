@@ -1,362 +1,229 @@
-use futures::future::join_all;
-use log::{debug, error, warn};
-use rand::seq::IteratorRandom;
+use std::collections::HashMap;
 use std::future::Future;
-use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use std::sync::{Arc, RwLock};
+
+use raynet_core::{
+    ChannelId, ConvId, CoreAction, CoreEvent, CoreEventResult, EndpointCore, RelayCore,
+};
+use raynet_shell_plugins::{ProxyMessage, ProxyPlugin, ProxySession};
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, sleep};
 
-use crate::channels::UdpChannels;
-use crate::connections::Connections;
+use crate::channels::{ChannelSenders, InboundTransportPacket};
 use crate::transport::OutboundTransportPacket;
-use crate::utils::now_millis;
-use raynet_core::core::{CoreAction, CoreEvent, EndpointCore};
-use raynet_core::{ChannelId, ConvId, OpenFailureReason, RelayCore};
+use crate::utils::CoreClock;
 
-async fn send_udp(socket: &UdpSocket, remote: SocketAddr, bytes: &[u8], buf: &mut [u8]) -> bool {
-    if bytes.len() > buf.len() {
-        error!("UDP packet is too large: {}", bytes.len());
-        return false;
-    }
-    buf[..bytes.len()].copy_from_slice(bytes);
-    match socket.send_to(&buf[..bytes.len()], remote).await {
-        Ok(sent_size) => {
-            debug!("Sent {} bytes to {}", sent_size, remote);
-            if bytes.len() != sent_size {
-                error!("Sent partial {} of {} bytes", sent_size, bytes.len());
-                return false;
-            }
-            true
-        }
-        Err(e) => {
-            error!("UDP failed to send to {}: {}", remote, e);
-            false
-        }
-    }
+type Sessions = HashMap<ConvId, mpsc::Sender<ProxyMessage>>;
+
+#[derive(Clone)]
+pub(crate) struct EndpointRuntime {
+    sessions: Arc<RwLock<Sessions>>,
+    proxy: Arc<dyn ProxyPlugin>,
+    core: Arc<Mutex<EndpointCore>>,
+    ray_tx: mpsc::Sender<OutboundTransportPacket>,
+    clock: Arc<CoreClock>,
 }
 
-async fn udp_in<F, Fut>(
-    udp_socket: Arc<UdpSocket>,
-    channels: Arc<UdpChannels>,
-    mut process_packet: F,
-) where
-    F: FnMut(ChannelId, Vec<u8>) -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let mut buf = vec![0u8; 65535];
-
-    loop {
-        match udp_socket.recv_from(&mut buf).await {
-            Ok((size, src)) => {
-                debug!("Received {} bytes from {}", size, src);
-                let channel_id = channels.channel_id_for_addr(src).unwrap_or(0);
-                process_packet(channel_id, buf[..size].to_vec()).await;
-            }
-            Err(e) => error!("Failed to receive from UDP: {}", e),
+impl EndpointRuntime {
+    pub fn new(
+        proxy: Arc<dyn ProxyPlugin>,
+        core: Arc<Mutex<EndpointCore>>,
+        ray_tx: mpsc::Sender<OutboundTransportPacket>,
+        clock: Arc<CoreClock>,
+    ) -> Self {
+        Self {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            proxy,
+            core,
+            ray_tx,
+            clock,
         }
+    }
+
+    pub async fn receive_packets(self, mut receiver: mpsc::Receiver<InboundTransportPacket>) {
+        while let Some(packet) = receiver.recv().await {
+            self.handle(CoreEvent::TransportPacketReceived {
+                channel_id: packet.channel_id,
+                bytes: packet.bytes,
+            })
+            .await;
+        }
+    }
+
+    pub async fn open(&self, session: ProxySession) {
+        let mut actions = Vec::new();
+        let result = self.core.lock().await.handle_event(
+            self.clock.elapsed_ms(),
+            CoreEvent::SessionOpen,
+            &mut actions,
+        );
+        let CoreEventResult::SessionCreated { conv_id } = result else {
+            unreachable!()
+        };
+        self.attach(conv_id, session);
+        self.execute(actions).await;
+    }
+
+    pub async fn send_failed(&self, packet: OutboundTransportPacket) {
+        self.handle(CoreEvent::TransportPacketSendFailed {
+            channel_id: packet.channel_id,
+            bytes: packet.bytes,
+        })
+        .await;
+    }
+
+    pub async fn poll(self) {
+        loop {
+            let now = self.clock.elapsed_ms();
+            let deadline = self.core.lock().await.next_deadline(now);
+            if deadline == u64::MAX {
+                sleep(Duration::from_millis(20)).await;
+            } else if deadline > now {
+                sleep(Duration::from_millis((deadline - now).min(100))).await;
+            } else {
+                let mut actions = Vec::new();
+                self.core
+                    .lock()
+                    .await
+                    .poll(self.clock.elapsed_ms(), &mut actions);
+                self.execute(actions).await;
+            }
+        }
+    }
+
+    async fn handle(&self, event: CoreEvent) {
+        let mut actions = Vec::new();
+        let _ = self
+            .core
+            .lock()
+            .await
+            .handle_event(self.clock.elapsed_ms(), event, &mut actions);
+        self.execute(actions).await;
+    }
+
+    async fn execute(&self, actions: Vec<CoreAction>) {
+        for action in actions {
+            match action {
+                CoreAction::OpenSession { conv_id } => {
+                    self.attach(conv_id, self.proxy.open());
+                }
+                CoreAction::WriteSession { conv_id, bytes } => {
+                    let input = self.sessions.read().unwrap().get(&conv_id).cloned();
+                    if let Some(input) = input {
+                        let _ = input.send(ProxyMessage::Write(bytes)).await;
+                    }
+                }
+                CoreAction::CloseSession { conv_id, reason } => {
+                    let input = self.sessions.write().unwrap().remove(&conv_id);
+                    if let Some(input) = input {
+                        let _ = input.send(ProxyMessage::Close(reason)).await;
+                    }
+                }
+                CoreAction::SendTransportPacket { channel_id, bytes } => {
+                    send_transport_action(&self.ray_tx, channel_id, bytes).await;
+                }
+            }
+        }
+    }
+
+    fn attach(&self, conv_id: ConvId, session: ProxySession) {
+        let (input, mut output) = session.split();
+        self.sessions.write().unwrap().insert(conv_id, input);
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            while let Some(message) = output.recv().await {
+                let closed = matches!(message, ProxyMessage::Close(_));
+                let event = match message {
+                    ProxyMessage::Write(bytes) => CoreEvent::SessionWrite { conv_id, bytes },
+                    ProxyMessage::Close(reason) => CoreEvent::SessionClose { conv_id, reason },
+                };
+                runtime.emit(event).await;
+                if closed {
+                    break;
+                }
+            }
+            runtime.sessions.write().unwrap().remove(&conv_id);
+        });
+    }
+
+    async fn emit(&self, event: CoreEvent) {
+        if let CoreEvent::SessionWrite { conv_id, bytes } = event {
+            loop {
+                let mut actions = Vec::new();
+                let result = self.core.lock().await.handle_event(
+                    self.clock.elapsed_ms(),
+                    CoreEvent::SessionWrite {
+                        conv_id,
+                        bytes: bytes.clone(),
+                    },
+                    &mut actions,
+                );
+                if matches!(result, CoreEventResult::SessionWriteBlocked) {
+                    sleep(Duration::from_millis(1)).await;
+                    continue;
+                }
+                assert!(matches!(result, CoreEventResult::None));
+                self.execute(actions).await;
+                return;
+            }
+        }
+        self.handle(event).await;
     }
 }
 
 pub async fn forward_in(
-    udp_socket: Arc<UdpSocket>,
+    mut receiver: mpsc::Receiver<InboundTransportPacket>,
     ray_tx: mpsc::Sender<OutboundTransportPacket>,
-    channels: Arc<UdpChannels>,
     relay_core: Arc<Mutex<RelayCore>>,
+    clock: Arc<CoreClock>,
 ) {
-    let process_forward = |channel_id: ChannelId, bytes: Vec<u8>| {
-        let ray_tx = ray_tx.clone();
-        let relay_core = relay_core.clone();
-        async move {
-            let mut actions = Vec::new();
-            let event = CoreEvent::TransportPacketReceived { channel_id, bytes };
-
-            let result = relay_core
-                .lock()
-                .await
-                .handle_event(now_millis(), event, &mut actions);
-
-            match result {
-                Ok(()) => send_transport_actions(ray_tx, actions).await,
-                Err(error) => warn!("RelayCore rejected transport packet: {}", error),
-            }
-        }
-    };
-
-    udp_in(udp_socket, channels, process_forward).await;
-}
-
-pub async fn endpoint_in(
-    udp_socket: Arc<UdpSocket>,
-    connections: Arc<RwLock<Connections>>,
-    channels: Arc<UdpChannels>,
-    endpoint_core: Arc<Mutex<EndpointCore>>,
-    ray_tx: mpsc::Sender<OutboundTransportPacket>,
-) {
-    let process_endpoint = |channel_id: ChannelId, bytes: Vec<u8>| {
-        let connections = connections.clone();
-        let endpoint_core = endpoint_core.clone();
-        let ray_tx = ray_tx.clone();
-        async move {
-            let mut actions = Vec::new();
-            let event = CoreEvent::TransportPacketReceived { channel_id, bytes };
-            let result = endpoint_core
-                .lock()
-                .await
-                .handle_event(now_millis(), event, &mut actions);
-            match result {
-                Ok(()) => {
-                    handle_endpoint_core_actions(connections, endpoint_core, ray_tx, actions).await
-                }
-                Err(error) => warn!("EndpointCore rejected transport packet: {}", error),
-            }
-        }
-    };
-
-    udp_in(udp_socket, channels, process_endpoint).await;
-}
-
-async fn handle_endpoint_core_actions(
-    connections: Arc<RwLock<Connections>>,
-    endpoint_core: Arc<Mutex<EndpointCore>>,
-    ray_tx: mpsc::Sender<OutboundTransportPacket>,
-    actions: Vec<CoreAction>,
-) {
-    for action in actions {
-        match action {
-            CoreAction::OpenExitConnection {
-                conv_id, target, ..
-            } => {
-                open_exit_connection(
-                    connections.clone(),
-                    endpoint_core.clone(),
-                    ray_tx.clone(),
-                    conv_id,
-                    target,
-                )
-                .await;
-            }
-            CoreAction::WriteSession { conv_id, bytes } => {
-                write_session(connections.clone(), conv_id, bytes).await;
-            }
-            CoreAction::CloseSession { conv_id, .. } => {
-                connections.write().await.remove_conv(conv_id);
-            }
-            CoreAction::SendTransportPacket { channel_id, bytes } => {
-                send_transport_action(ray_tx.clone(), channel_id, bytes).await;
-            }
-            CoreAction::IngressSessionCreated { .. }
-            | CoreAction::EmitMetric(_)
-            | CoreAction::EmitEvent(_) => {}
-        }
-    }
-}
-
-async fn open_exit_connection(
-    connections: Arc<RwLock<Connections>>,
-    endpoint_core: Arc<Mutex<EndpointCore>>,
-    ray_tx: mpsc::Sender<OutboundTransportPacket>,
-    conv_id: ConvId,
-    target: raynet_core::Target,
-) {
-    let target_addr = format!("{}:{}", target.host, target.port);
-    let stream = match TcpStream::connect(&target_addr).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            error!(
-                "Failed to open exit connection to {}: {}",
-                target_addr, error
-            );
-            emit_endpoint_core_event(
-                endpoint_core,
-                ray_tx,
-                CoreEvent::ExitConnectionOpenFailed {
-                    conv_id,
-                    reason: OpenFailureReason::Error(error.to_string()),
-                },
-            )
-            .await;
-            return;
-        }
-    };
-    let addr = match stream.peer_addr() {
-        Ok(addr) => addr,
-        Err(error) => {
-            error!("Failed to read peer address for {}: {}", target_addr, error);
-            return;
-        }
-    };
-    let (read, write) = stream.into_split();
-    connections
-        .write()
-        .await
-        .insert_session(addr, conv_id, write);
-
-    emit_endpoint_core_event(
-        endpoint_core.clone(),
-        ray_tx.clone(),
-        CoreEvent::ExitConnectionOpened { conv_id },
-    )
-    .await;
-
-    tokio::spawn(read_exit_connection(read, conv_id, endpoint_core, ray_tx));
-}
-
-async fn read_exit_connection(
-    read: tokio::net::tcp::OwnedReadHalf,
-    conv_id: ConvId,
-    endpoint_core: Arc<Mutex<EndpointCore>>,
-    ray_tx: mpsc::Sender<OutboundTransportPacket>,
-) {
-    let mut buf = vec![0u8; 65535];
-    loop {
-        match read.try_read(&mut buf) {
-            Ok(0) => {
-                emit_endpoint_core_event(
-                    endpoint_core,
-                    ray_tx,
-                    CoreEvent::SessionClosed {
-                        conv_id,
-                        reason: raynet_core::CloseReason::RemoteClosed,
-                    },
-                )
-                .await;
-                break;
-            }
-            Ok(len) => {
-                emit_endpoint_core_event(
-                    endpoint_core.clone(),
-                    ray_tx.clone(),
-                    CoreEvent::SessionBytes {
-                        conv_id,
-                        bytes: buf[..len].to_vec(),
-                    },
-                )
-                .await;
-            }
-            Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => {
-                sleep(Duration::from_millis(1)).await;
-            }
-            Err(error) => {
-                emit_endpoint_core_event(
-                    endpoint_core,
-                    ray_tx,
-                    CoreEvent::SessionClosed {
-                        conv_id,
-                        reason: raynet_core::CloseReason::Error(error.to_string()),
-                    },
-                )
-                .await;
-                break;
-            }
-        }
-    }
-}
-
-async fn write_session(connections: Arc<RwLock<Connections>>, conv_id: ConvId, bytes: Vec<u8>) {
-    let connections = connections.read().await;
-    let Some(write) = connections.get(conv_id) else {
-        warn!("No local session {} for write action", conv_id);
-        return;
-    };
-    let mut remaining = bytes.as_slice();
-    while !remaining.is_empty() {
-        match write.try_write(remaining) {
-            Ok(n) => remaining = &remaining[n..],
-            Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => {
-                sleep(Duration::from_millis(1)).await;
-            }
-            Err(error) => {
-                error!("Failed to write to local session {}: {}", conv_id, error);
-                break;
-            }
-        }
-    }
-}
-
-async fn emit_endpoint_core_event(
-    endpoint_core: Arc<Mutex<EndpointCore>>,
-    ray_tx: mpsc::Sender<OutboundTransportPacket>,
-    event: CoreEvent,
-) {
-    let mut actions = Vec::new();
-    match endpoint_core
-        .lock()
-        .await
-        .handle_event(now_millis(), event, &mut actions)
-    {
-        Ok(()) => send_transport_actions(ray_tx, actions).await,
-        Err(error) => error!("EndpointCore rejected exit event: {}", error),
+    while let Some(packet) = receiver.recv().await {
+        let mut actions = Vec::new();
+        let _ = relay_core.lock().await.handle_event(
+            clock.elapsed_ms(),
+            CoreEvent::TransportPacketReceived {
+                channel_id: packet.channel_id,
+                bytes: packet.bytes,
+            },
+            &mut actions,
+        );
+        send_transport_actions(&ray_tx, actions).await;
     }
 }
 
 async fn send_transport_actions(
-    ray_tx: mpsc::Sender<OutboundTransportPacket>,
+    ray_tx: &mpsc::Sender<OutboundTransportPacket>,
     actions: Vec<CoreAction>,
 ) {
     for action in actions {
         if let CoreAction::SendTransportPacket { channel_id, bytes } = action {
-            send_transport_action(ray_tx.clone(), channel_id, bytes).await;
+            send_transport_action(ray_tx, channel_id, bytes).await;
         }
     }
 }
 
 async fn send_transport_action(
-    ray_tx: mpsc::Sender<OutboundTransportPacket>,
+    ray_tx: &mpsc::Sender<OutboundTransportPacket>,
     channel_id: ChannelId,
     bytes: Vec<u8>,
 ) {
-    if let Err(error) = ray_tx
+    ray_tx
         .send(OutboundTransportPacket { channel_id, bytes })
         .await
-    {
-        error!(
-            "Failed to enqueue endpoint core transport packet: {}",
-            error
-        );
-    }
+        .unwrap();
 }
 
-async fn udp_out<T, F>(mut rx: mpsc::Receiver<T>, channels: Arc<UdpChannels>, process_packet: F)
-where
-    F: Fn(T) -> (ChannelId, Vec<u8>),
+pub async fn forward_out<F, Fut>(
+    mut rx: mpsc::Receiver<OutboundTransportPacket>,
+    channels: Arc<ChannelSenders>,
+    mut on_failure: F,
+) where
+    F: FnMut(OutboundTransportPacket) -> Fut,
+    Fut: Future<Output = ()>,
 {
-    let udp_socket_outs: Vec<UdpSocket> = join_all(
-        (0..32)
-            .map(|_| UdpSocket::bind("[::0]:0"))
-            .collect::<Vec<_>>(),
-    )
-    .await
-    .into_iter()
-    .collect::<Result<_, _>>()
-    .unwrap();
-    let mut buf = vec![0u8; 65535];
     while let Some(packet) = rx.recv().await {
-        let udp_socket_index = {
-            let mut rng = rand::rng();
-            (0..udp_socket_outs.len()).choose(&mut rng).unwrap()
-        };
-        let (channel_id, packet) = process_packet(packet);
-        let Some(remote) = channels.addr(channel_id) else {
-            warn!("Selected channel {} has no UDP address", channel_id);
-            continue;
-        };
-
-        let _ = send_udp(
-            &udp_socket_outs[udp_socket_index],
-            remote,
-            &packet,
-            &mut buf,
-        )
-        .await;
+        if let Err(packet) = channels.send(packet).await {
+            on_failure(packet).await;
+        }
     }
-}
-
-pub async fn forward_out(
-    ray_rx: mpsc::Receiver<OutboundTransportPacket>,
-    channels: Arc<UdpChannels>,
-) {
-    udp_out(ray_rx, channels, |packet| (packet.channel_id, packet.bytes)).await
 }

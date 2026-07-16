@@ -1,20 +1,22 @@
 use std::collections::BTreeMap;
 
 use raynet_core::{
-    ChannelId, ChannelState, ConvId, CoreAction, CoreEvent, EndpointConfig, EndpointCore, Metadata,
-    NodeId, RelayConfig, RelayCore, RouteChannel, RouteNode, RouteTopology, Target,
-    TransportMetrics,
+    ChannelId, CloseReason, ConvId, CoreAction, CoreEvent, CoreEventResult, EndpointConfig,
+    EndpointCore, KcpConfig, RelayConfig, RelayCore, RouteConfig, RouteEdge, RouteGraph, RouteNode,
 };
+
+pub type SimNodeId = u64;
 
 #[derive(Debug, Clone)]
 pub struct SimLink {
-    pub from_node: NodeId,
+    pub from_node: SimNodeId,
     pub from_channel_id: ChannelId,
-    pub to_node: NodeId,
+    pub to_node: SimNodeId,
     pub to_channel_id: ChannelId,
     pub latency_ms: u64,
     pub bandwidth_bytes_per_ms: u64,
     pub loss_every: Option<u64>,
+    pub extra_delay_ms: u64,
     pub down_windows: Vec<DownWindow>,
 }
 
@@ -35,29 +37,38 @@ pub struct TestMetrics {
 
 pub struct TestShell {
     now_ms: u64,
-    nodes: BTreeMap<NodeId, SimNode>,
+    nodes: BTreeMap<SimNodeId, SimNode>,
     links: Vec<SimLink>,
+    link_attempts: Vec<u64>,
     packets: Vec<ScheduledPacket>,
+    captured_packets: BTreeMap<(SimNodeId, ChannelId), ScheduledPacket>,
+    link_next_tx: BTreeMap<(SimNodeId, ChannelId), u64>,
     metrics: TestMetrics,
-    delivered_by_outbound_channel: BTreeMap<(NodeId, ChannelId), u64>,
+    delivered_by_outbound_channel: BTreeMap<(SimNodeId, ChannelId), u64>,
 }
 
 enum SimNode {
     Endpoint {
-        core: EndpointCore,
+        core: Box<EndpointCore>,
+        config: EndpointConfig,
+        started_at_sim_ms: u64,
         sessions: BTreeMap<ConvId, Vec<u8>>,
         echo_exit: bool,
+        blocked_writes: BTreeMap<ConvId, Vec<u8>>,
     },
     Relay {
-        core: RelayCore,
+        core: Box<RelayCore>,
+        config: RelayConfig,
+        started_at_sim_ms: u64,
     },
 }
 
+#[derive(Clone)]
 struct ScheduledPacket {
     due_ms: u64,
-    from_node: NodeId,
+    from_node: SimNodeId,
     from_channel_id: ChannelId,
-    to_node: NodeId,
+    to_node: SimNodeId,
     to_channel_id: ChannelId,
     bytes: Vec<u8>,
 }
@@ -68,7 +79,10 @@ impl TestShell {
             now_ms: 0,
             nodes: BTreeMap::new(),
             links: Vec::new(),
+            link_attempts: Vec::new(),
             packets: Vec::new(),
+            captured_packets: BTreeMap::new(),
+            link_next_tx: BTreeMap::new(),
             metrics: TestMetrics::default(),
             delivered_by_outbound_channel: BTreeMap::new(),
         }
@@ -77,126 +91,204 @@ impl TestShell {
     pub fn now_ms(&self) -> u64 {
         self.now_ms
     }
-
     pub fn metrics(&self) -> TestMetrics {
         self.metrics
     }
 
-    pub fn add_endpoint(&mut self, config: EndpointConfig, echo_exit: bool) {
+    pub fn add_endpoint(&mut self, node_id: SimNodeId, config: EndpointConfig, echo_exit: bool) {
         self.nodes.insert(
-            config.local_node_id,
+            node_id,
             SimNode::Endpoint {
-                core: EndpointCore::new(config).expect("valid endpoint config"),
+                core: Box::new(EndpointCore::new(config.clone())),
+                config,
+                started_at_sim_ms: self.now_ms,
                 sessions: BTreeMap::new(),
                 echo_exit,
+                blocked_writes: BTreeMap::new(),
             },
         );
     }
 
-    pub fn add_relay(&mut self, config: RelayConfig) {
+    pub fn add_relay(&mut self, node_id: SimNodeId, config: RelayConfig) {
         self.nodes.insert(
-            config.local_node_id,
+            node_id,
             SimNode::Relay {
-                core: RelayCore::new(config).expect("valid relay config"),
+                core: Box::new(RelayCore::new(config.clone())),
+                config,
+                started_at_sim_ms: self.now_ms,
             },
         );
+    }
+
+    pub fn restart_node(&mut self, node_id: SimNodeId) {
+        let Some(node) = self.nodes.get_mut(&node_id) else {
+            return;
+        };
+        match node {
+            SimNode::Endpoint {
+                core,
+                config,
+                started_at_sim_ms,
+                sessions,
+                blocked_writes,
+                ..
+            } => {
+                let uptime_ms = self.now_ms - *started_at_sim_ms;
+                config.boot_time_ms = config.boot_time_ms.saturating_add(uptime_ms);
+                advance_seed(&mut config.random_seed);
+                **core = EndpointCore::new(config.clone());
+                *started_at_sim_ms = self.now_ms;
+                sessions.clear();
+                blocked_writes.clear();
+            }
+            SimNode::Relay {
+                core,
+                config,
+                started_at_sim_ms,
+            } => {
+                let uptime_ms = self.now_ms - *started_at_sim_ms;
+                config.boot_time_ms = config.boot_time_ms.saturating_add(uptime_ms);
+                advance_seed(&mut config.random_seed);
+                **core = RelayCore::new(config.clone());
+                *started_at_sim_ms = self.now_ms;
+            }
+        }
     }
 
     pub fn add_link(&mut self, link: SimLink) {
         self.links.push(link);
+        self.link_attempts.push(0);
     }
 
-    pub fn set_channel_state(
-        &mut self,
-        node_id: NodeId,
-        channel_id: ChannelId,
-        state: ChannelState,
-    ) {
-        let metrics = TransportMetrics {
-            queue_pressure: 0.0,
-            send_error: state != ChannelState::Up,
-        };
-        self.handle_event(
-            node_id,
-            CoreEvent::TransportChannelUpdated {
-                channel_id,
-                state,
-                metrics,
-            },
-        );
-    }
-
-    pub fn open_ingress(&mut self, node_id: NodeId, target: Target) -> ConvId {
+    pub fn open_session(&mut self, node_id: SimNodeId) -> ConvId {
         let mut actions = Vec::new();
+        let elapsed_ms = self.elapsed(node_id);
         let result = match self.nodes.get_mut(&node_id) {
-            Some(SimNode::Endpoint { core, .. }) => core.handle_event(
-                self.now_ms,
-                CoreEvent::IngressSessionRequested {
-                    target,
-                    metadata: Metadata::new(),
-                },
-                &mut actions,
-            ),
+            Some(SimNode::Endpoint { core, sessions, .. }) => {
+                let result = core.handle_event(elapsed_ms, CoreEvent::SessionOpen, &mut actions);
+                let CoreEventResult::SessionCreated { conv_id } = result else {
+                    panic!("SessionOpen must return SessionCreated");
+                };
+                sessions.entry(conv_id).or_default();
+                conv_id
+            }
             _ => panic!("node {node_id} is not an endpoint"),
         };
-        result.expect("ingress session opens");
-        let conv_id = actions
-            .iter()
-            .find_map(|action| match action {
-                CoreAction::IngressSessionCreated { conv_id } => Some(*conv_id),
-                _ => None,
-            })
-            .expect("core creates ingress session");
-        if let Some(SimNode::Endpoint { sessions, .. }) = self.nodes.get_mut(&node_id) {
-            sessions.insert(conv_id, Vec::new());
-        }
         self.handle_actions(node_id, actions);
-        conv_id
+        result
     }
 
     pub fn send_session_bytes(
         &mut self,
-        node_id: NodeId,
+        node_id: SimNodeId,
         conv_id: ConvId,
         bytes: impl Into<Vec<u8>>,
     ) {
-        self.handle_event(
-            node_id,
-            CoreEvent::SessionBytes {
-                conv_id,
-                bytes: bytes.into(),
-            },
-        );
-    }
-
-    pub fn session_bytes(&self, node_id: NodeId, conv_id: ConvId) -> Option<&[u8]> {
-        let Some(SimNode::Endpoint { sessions, .. }) = self.nodes.get(&node_id) else {
-            return None;
+        let bytes = bytes.into();
+        let mut actions = Vec::new();
+        let elapsed_ms = self.elapsed(node_id);
+        let result = match self.nodes.get_mut(&node_id) {
+            Some(SimNode::Endpoint {
+                core,
+                blocked_writes,
+                ..
+            }) => {
+                let result = core.handle_event(
+                    elapsed_ms,
+                    CoreEvent::SessionWrite {
+                        conv_id,
+                        bytes: bytes.clone(),
+                    },
+                    &mut actions,
+                );
+                if matches!(result, CoreEventResult::SessionWriteBlocked) {
+                    blocked_writes.insert(conv_id, bytes);
+                } else {
+                    blocked_writes.remove(&conv_id);
+                }
+                result
+            }
+            _ => panic!("node {node_id} is not an endpoint"),
         };
-        sessions.get(&conv_id).map(Vec::as_slice)
+        assert!(
+            matches!(
+                result,
+                CoreEventResult::None | CoreEventResult::SessionWriteBlocked
+            ),
+            "unexpected SessionWrite result"
+        );
+        self.handle_actions(node_id, actions);
     }
 
-    pub fn delivered_on(&self, node_id: NodeId, channel_id: ChannelId) -> u64 {
+    pub fn close_session(&mut self, node_id: SimNodeId, conv_id: ConvId, reason: CloseReason) {
+        self.handle_event(node_id, CoreEvent::SessionClose { conv_id, reason });
+    }
+
+    pub fn has_session(&self, node_id: SimNodeId, conv_id: ConvId) -> bool {
+        match self.nodes.get(&node_id) {
+            Some(SimNode::Endpoint { sessions, .. }) => sessions.contains_key(&conv_id),
+            _ => false,
+        }
+    }
+
+    pub fn active_sessions(&self, node_id: SimNodeId) -> usize {
+        match self.nodes.get(&node_id) {
+            Some(SimNode::Endpoint { core, .. }) => core.metrics().active_sessions,
+            _ => 0,
+        }
+    }
+
+    pub fn drop_queued_from(&mut self, from_node: SimNodeId, channel_id: ChannelId) -> usize {
+        let before = self.packets.len();
+        self.packets.retain(|packet| {
+            !(packet.from_node == from_node && packet.from_channel_id == channel_id)
+        });
+        let dropped = before - self.packets.len();
+        self.metrics.dropped_packets = self.metrics.dropped_packets.saturating_add(dropped as u64);
+        dropped
+    }
+
+    pub fn session_bytes(&self, node_id: SimNodeId, conv_id: ConvId) -> Option<&[u8]> {
+        match self.nodes.get(&node_id) {
+            Some(SimNode::Endpoint { sessions, .. }) => sessions.get(&conv_id).map(Vec::as_slice),
+            _ => None,
+        }
+    }
+
+    pub fn delivered_on(&self, node_id: SimNodeId, channel_id: ChannelId) -> u64 {
         self.delivered_by_outbound_channel
             .get(&(node_id, channel_id))
             .copied()
             .unwrap_or(0)
     }
 
+    pub fn replay_last_packet(&mut self, from_node: SimNodeId, channel_id: ChannelId) -> bool {
+        let Some(packet) = self.captured_packets.get(&(from_node, channel_id)).cloned() else {
+            return false;
+        };
+        self.packets.push(ScheduledPacket {
+            due_ms: self.now_ms,
+            ..packet
+        });
+        true
+    }
+
     pub fn run_until_idle(&mut self, max_steps: usize) {
         for _ in 0..max_steps {
-            let next_packet = self
+            self.retry_blocked_writes();
+            let packet = self
                 .next_packet_index()
                 .map(|index| (index, self.packets[index].due_ms));
-            let next_poll = self.next_poll_deadline();
-
-            match (next_packet, next_poll) {
+            let poll = self.next_poll_deadline();
+            match (packet, poll) {
                 (None, None) => return,
-                (Some((_index, packet_due)), Some((node_id, poll_due)))
-                    if poll_due < packet_due =>
-                {
-                    self.now_ms = self.now_ms.max(poll_due);
-                    self.poll_node(node_id);
+                (Some((_index, due)), Some((node, poll_due))) if poll_due < due => {
+                    self.now_ms = if poll_due <= self.now_ms {
+                        self.now_ms.saturating_add(1)
+                    } else {
+                        poll_due
+                    };
+                    self.poll_node(node);
                 }
                 (Some((index, _)), _) => {
                     let packet = self.packets.remove(index);
@@ -215,62 +307,100 @@ impl TestShell {
                         },
                     );
                 }
-                (None, Some((node_id, poll_due))) => {
-                    self.now_ms = self.now_ms.max(poll_due);
-                    self.poll_node(node_id);
+                (None, Some((node, due))) => {
+                    self.now_ms = if due <= self.now_ms {
+                        self.now_ms.saturating_add(1)
+                    } else {
+                        due
+                    };
+                    self.poll_node(node);
                 }
             }
         }
     }
 
-    fn handle_event(&mut self, node_id: NodeId, event: CoreEvent) {
-        let mut actions = Vec::new();
-        let result = match self.nodes.get_mut(&node_id) {
-            Some(SimNode::Endpoint { core, .. }) => {
-                core.handle_event(self.now_ms, event, &mut actions)
+    fn retry_blocked_writes(&mut self) {
+        let retries: Vec<_> = self
+            .nodes
+            .iter()
+            .filter_map(|(node_id, node)| match node {
+                SimNode::Endpoint { blocked_writes, .. } if !blocked_writes.is_empty() => Some((
+                    *node_id,
+                    blocked_writes
+                        .iter()
+                        .map(|(conv_id, bytes)| (*conv_id, bytes.clone()))
+                        .collect::<Vec<_>>(),
+                )),
+                _ => None,
+            })
+            .collect();
+        for (node_id, writes) in retries {
+            for (conv_id, bytes) in writes {
+                self.send_session_bytes(node_id, conv_id, bytes);
             }
-            Some(SimNode::Relay { core }) => core.handle_event(self.now_ms, event, &mut actions),
-            None => return,
-        };
-        if result.is_ok() {
-            self.handle_actions(node_id, actions);
         }
     }
 
-    fn handle_actions(&mut self, node_id: NodeId, actions: Vec<CoreAction>) {
+    fn elapsed(&self, node_id: SimNodeId) -> u64 {
+        let started = match self.nodes.get(&node_id) {
+            Some(
+                SimNode::Endpoint {
+                    started_at_sim_ms, ..
+                }
+                | SimNode::Relay {
+                    started_at_sim_ms, ..
+                },
+            ) => *started_at_sim_ms,
+            None => return 0,
+        };
+        self.now_ms.saturating_sub(started)
+    }
+
+    fn handle_event(&mut self, node_id: SimNodeId, event: CoreEvent) {
+        let mut actions = Vec::new();
+        let elapsed_ms = self.elapsed(node_id);
+        match self.nodes.get_mut(&node_id) {
+            Some(SimNode::Endpoint { core, .. }) => {
+                let _ = core.handle_event(elapsed_ms, event, &mut actions);
+            }
+            Some(SimNode::Relay { core, .. }) => {
+                let _ = core.handle_event(elapsed_ms, event, &mut actions);
+            }
+            None => return,
+        }
+        self.handle_actions(node_id, actions);
+    }
+
+    fn handle_actions(&mut self, node_id: SimNodeId, actions: Vec<CoreAction>) {
         for action in actions {
             match action {
                 CoreAction::SendTransportPacket { channel_id, bytes } => {
-                    self.send_transport(node_id, channel_id, bytes);
+                    self.send_transport(node_id, channel_id, bytes)
                 }
-                CoreAction::IngressSessionCreated { conv_id } => {
+                CoreAction::OpenSession { conv_id } => {
                     if let Some(SimNode::Endpoint { sessions, .. }) = self.nodes.get_mut(&node_id) {
                         sessions.entry(conv_id).or_default();
                     }
-                }
-                CoreAction::OpenExitConnection {
-                    conv_id, target, ..
-                } => {
-                    if let Some(SimNode::Endpoint { sessions, .. }) = self.nodes.get_mut(&node_id) {
-                        sessions.entry(conv_id).or_default();
-                    }
-                    let _ = target;
-                    self.handle_event(node_id, CoreEvent::ExitConnectionOpened { conv_id });
                 }
                 CoreAction::WriteSession { conv_id, bytes } => {
-                    self.write_session(node_id, conv_id, bytes);
+                    self.write_session(node_id, conv_id, bytes)
                 }
                 CoreAction::CloseSession { conv_id, .. } => {
-                    if let Some(SimNode::Endpoint { sessions, .. }) = self.nodes.get_mut(&node_id) {
+                    if let Some(SimNode::Endpoint {
+                        sessions,
+                        blocked_writes,
+                        ..
+                    }) = self.nodes.get_mut(&node_id)
+                    {
                         sessions.remove(&conv_id);
+                        blocked_writes.remove(&conv_id);
                     }
                 }
-                CoreAction::EmitMetric(_) | CoreAction::EmitEvent(_) => {}
             }
         }
     }
 
-    fn write_session(&mut self, node_id: NodeId, conv_id: ConvId, bytes: Vec<u8>) {
+    fn write_session(&mut self, node_id: SimNodeId, conv_id: ConvId, bytes: Vec<u8>) {
         let echo_exit = match self.nodes.get_mut(&node_id) {
             Some(SimNode::Endpoint {
                 sessions,
@@ -285,9 +415,8 @@ impl TestShell {
             }
             _ => false,
         };
-
         if echo_exit {
-            self.handle_event(node_id, CoreEvent::SessionBytes { conv_id, bytes });
+            self.send_session_bytes(node_id, conv_id, bytes);
         } else {
             self.metrics.delivered_local_bytes = self
                 .metrics
@@ -297,48 +426,54 @@ impl TestShell {
         }
     }
 
-    fn send_transport(&mut self, node_id: NodeId, channel_id: ChannelId, bytes: Vec<u8>) {
+    fn send_transport(&mut self, node_id: SimNodeId, channel_id: ChannelId, bytes: Vec<u8>) {
         self.metrics.sent_packets = self.metrics.sent_packets.saturating_add(1);
-        let Some(link) = self
+        let Some(link_index) = self
             .links
             .iter()
-            .find(|link| link.from_node == node_id && link.from_channel_id == channel_id)
-            .cloned()
+            .position(|link| link.from_node == node_id && link.from_channel_id == channel_id)
         else {
-            self.metrics.dropped_packets = self.metrics.dropped_packets.saturating_add(1);
-            self.channel_failed(node_id, channel_id);
+            self.transport_send_failed(node_id, channel_id, bytes);
             return;
         };
-
-        if link.is_down(self.now_ms) || link.should_drop(self.metrics.sent_packets) {
-            self.metrics.dropped_packets = self.metrics.dropped_packets.saturating_add(1);
-            self.channel_failed(node_id, channel_id);
+        let link = self.links[link_index].clone();
+        self.link_attempts[link_index] = self.link_attempts[link_index].saturating_add(1);
+        if link.is_down(self.now_ms) {
+            self.transport_send_failed(node_id, channel_id, bytes);
             return;
         }
-
-        let bandwidth = link.bandwidth_bytes_per_ms.max(1);
-        let transmit_ms = (bytes.len() as u64).div_ceil(bandwidth);
-        self.packets.push(ScheduledPacket {
-            due_ms: self.now_ms + link.latency_ms + transmit_ms,
+        if link.should_drop(self.link_attempts[link_index]) {
+            self.metrics.dropped_packets = self.metrics.dropped_packets.saturating_add(1);
+            return;
+        }
+        let next = self
+            .link_next_tx
+            .entry((node_id, channel_id))
+            .or_insert(self.now_ms);
+        let starts_at = (*next).max(self.now_ms);
+        let transmit_ms = (bytes.len() as u64).div_ceil(link.bandwidth_bytes_per_ms.max(1));
+        *next = starts_at.saturating_add(transmit_ms);
+        let packet = ScheduledPacket {
+            due_ms: starts_at
+                .saturating_add(transmit_ms)
+                .saturating_add(link.latency_ms)
+                .saturating_add(link.extra_delay_ms),
             from_node: node_id,
             from_channel_id: channel_id,
             to_node: link.to_node,
             to_channel_id: link.to_channel_id,
             bytes,
-        });
+        };
+        self.captured_packets
+            .insert((node_id, channel_id), packet.clone());
+        self.packets.push(packet);
     }
 
-    fn channel_failed(&mut self, node_id: NodeId, channel_id: ChannelId) {
+    fn transport_send_failed(&mut self, node_id: SimNodeId, channel_id: ChannelId, bytes: Vec<u8>) {
+        self.metrics.dropped_packets = self.metrics.dropped_packets.saturating_add(1);
         self.handle_event(
             node_id,
-            CoreEvent::TransportChannelUpdated {
-                channel_id,
-                state: ChannelState::Degraded,
-                metrics: TransportMetrics {
-                    queue_pressure: 1.0,
-                    send_error: true,
-                },
-            },
+            CoreEvent::TransportPacketSendFailed { channel_id, bytes },
         );
     }
 
@@ -350,30 +485,64 @@ impl TestShell {
             .map(|(index, _)| index)
     }
 
-    fn next_poll_deadline(&self) -> Option<(NodeId, u64)> {
+    fn next_poll_deadline(&self) -> Option<(SimNodeId, u64)> {
         self.nodes
             .iter()
             .filter_map(|(node_id, node)| {
+                let elapsed = self.elapsed(*node_id);
                 let deadline = match node {
-                    SimNode::Endpoint { core, .. } => core.next_deadline(self.now_ms),
-                    SimNode::Relay { core } => core.next_deadline(self.now_ms),
+                    SimNode::Endpoint {
+                        core,
+                        started_at_sim_ms,
+                        ..
+                    } => {
+                        let deadline = core.next_deadline(elapsed);
+                        if deadline == u64::MAX {
+                            None
+                        } else {
+                            Some(deadline.saturating_add(*started_at_sim_ms))
+                        }
+                    }
+                    SimNode::Relay {
+                        core,
+                        started_at_sim_ms,
+                        ..
+                    } => {
+                        let deadline = core.next_deadline(elapsed);
+                        if deadline == u64::MAX {
+                            None
+                        } else {
+                            Some(deadline.saturating_add(*started_at_sim_ms))
+                        }
+                    }
                 }?;
                 Some((*node_id, deadline))
             })
             .min_by_key(|(_, deadline)| *deadline)
     }
 
-    fn poll_node(&mut self, node_id: NodeId) {
+    fn poll_node(&mut self, node_id: SimNodeId) {
         let mut actions = Vec::new();
-        let result = match self.nodes.get_mut(&node_id) {
-            Some(SimNode::Endpoint { core, .. }) => core.poll(self.now_ms, &mut actions),
-            Some(SimNode::Relay { core }) => core.poll(self.now_ms, &mut actions),
+        let elapsed = self.elapsed(node_id);
+        match self.nodes.get_mut(&node_id) {
+            Some(SimNode::Endpoint { core, .. }) => core.poll(elapsed, &mut actions),
+            Some(SimNode::Relay { core, .. }) => core.poll(elapsed, &mut actions),
             None => return,
-        };
-        if result.is_ok() {
-            self.handle_actions(node_id, actions);
+        }
+        self.handle_actions(node_id, actions);
+        self.retry_blocked_writes();
+    }
+}
+
+fn advance_seed(seed: &mut [u8; 16]) {
+    for byte in seed {
+        let (next, carry) = byte.overflowing_add(1);
+        *byte = next;
+        if !carry {
+            return;
         }
     }
+    panic!("test shell restart seed exhausted");
 }
 
 impl Default for TestShell {
@@ -388,59 +557,70 @@ impl SimLink {
             .iter()
             .any(|window| now_ms >= window.start_ms && now_ms < window.end_ms)
     }
-
     fn should_drop(&self, sent_packets: u64) -> bool {
         self.loss_every
-            .is_some_and(|loss_every| loss_every > 0 && sent_packets % loss_every == 0)
+            .is_some_and(|every| sent_packets.is_multiple_of(every))
     }
 }
 
-pub fn route_channel(channel_id: ChannelId, peer_node_id: NodeId) -> RouteChannel {
-    RouteChannel {
+pub fn route_edge(channel_id: ChannelId, next: u32) -> RouteEdge {
+    RouteEdge {
         channel_id,
-        peer_node_id,
+        next,
+        capacity_hint_kbps: 0,
+        latency_hint_ms: 0,
     }
 }
 
-pub fn topology(nodes: Vec<(NodeId, Vec<RouteChannel>)>) -> RouteTopology {
-    RouteTopology {
-        nodes: nodes
-            .into_iter()
-            .map(|(node_id, channels)| RouteNode { node_id, channels })
-            .collect(),
+pub fn route_graph(nodes: Vec<Vec<RouteEdge>>) -> RouteGraph {
+    RouteGraph {
+        nodes: nodes.into_iter().map(|edges| RouteNode { edges }).collect(),
     }
+}
+
+pub fn kcp_config() -> KcpConfig {
+    KcpConfig::default()
 }
 
 pub fn endpoint_config(
-    local_node_id: NodeId,
     envelope_key: [u8; 16],
     message_key: [u8; 16],
     random_seed: [u8; 16],
+    boot_time_ms: u64,
     local_channels: Vec<ChannelId>,
-    route_topology: RouteTopology,
+    route_graph: RouteGraph,
+    kcp: KcpConfig,
 ) -> EndpointConfig {
     EndpointConfig {
-        local_node_id,
         envelope_key,
         message_key,
         random_seed,
+        boot_time_ms,
+        kcp,
         local_channels,
-        route_topology,
-        transport_mtu: 1200,
+        route: RouteConfig {
+            graph: route_graph,
+            min_mtu: 1200,
+            feedback_interval_ms: 1_000,
+            feedback_timeout_ms: 5_000,
+        },
+        padding_reserve: 128,
+        keepalive_interval_ms: 0,
     }
 }
 
 pub fn relay_config(
-    local_node_id: NodeId,
     envelope_key: [u8; 16],
     random_seed: [u8; 16],
+    boot_time_ms: u64,
     local_channels: Vec<ChannelId>,
 ) -> RelayConfig {
     RelayConfig {
-        local_node_id,
         envelope_key,
         random_seed,
+        boot_time_ms,
         local_channels,
+        local_min_mtu: 1200,
     }
 }
 
@@ -452,219 +632,341 @@ mod tests {
     const MESSAGE_KEY: [u8; 16] = [7; 16];
 
     #[test]
-    fn test_shell_delivers_echo_through_relay_with_virtual_time() {
+    fn echo_uses_the_selected_multihop_route() {
         let mut shell = TestShell::new();
         shell.add_endpoint(
+            1,
             endpoint_config(
-                1,
                 ENVELOPE_KEY,
                 MESSAGE_KEY,
                 [1; 16],
-                vec![11],
-                topology(vec![
-                    (1, vec![route_channel(11, 2)]),
-                    (2, vec![route_channel(21, 3)]),
-                    (3, Vec::new()),
+                0,
+                vec![11, 12],
+                route_graph(vec![
+                    vec![route_edge(11, 1), route_edge(12, 2)],
+                    vec![route_edge(21, 3)],
+                    vec![route_edge(31, 3)],
+                    vec![],
                 ]),
+                kcp_config(),
             ),
             false,
         );
-        shell.add_relay(relay_config(2, ENVELOPE_KEY, [2; 16], vec![21, 22]));
+        shell.add_relay(2, relay_config(ENVELOPE_KEY, [2; 16], 0, vec![21, 51]));
+        shell.add_relay(3, relay_config(ENVELOPE_KEY, [3; 16], 0, vec![31]));
         shell.add_endpoint(
+            4,
             endpoint_config(
-                3,
-                ENVELOPE_KEY,
-                MESSAGE_KEY,
-                [3; 16],
-                vec![31],
-                topology(vec![
-                    (3, vec![route_channel(31, 2)]),
-                    (2, vec![route_channel(22, 1)]),
-                    (1, Vec::new()),
-                ]),
-            ),
-            true,
-        );
-        shell.add_link(link(1, 11, 2, 201, 10, 100));
-        shell.add_link(link(2, 21, 3, 301, 20, 100));
-        shell.add_link(link(3, 31, 2, 202, 30, 100));
-        shell.add_link(link(2, 22, 1, 101, 40, 100));
-
-        let conv_id = shell.open_ingress(
-            1,
-            Target {
-                host: "echo.invalid".to_string(),
-                port: 7,
-            },
-        );
-        shell.run_until_idle(16);
-        shell.send_session_bytes(1, conv_id, b"hello".to_vec());
-        shell.run_until_idle(128);
-
-        assert_eq!(shell.session_bytes(1, conv_id), Some(&b"hello"[..]));
-        assert_eq!(shell.metrics().delivered_local_bytes, 5);
-        assert!(shell.metrics().last_delivery_ms >= 100);
-    }
-
-    #[test]
-    fn test_shell_tracks_loss_and_temporary_disconnect() {
-        let mut shell = TestShell::new();
-        shell.add_relay(relay_config(2, ENVELOPE_KEY, [2; 16], vec![21, 22]));
-        shell.add_link(SimLink {
-            from_node: 2,
-            from_channel_id: 21,
-            to_node: 9,
-            to_channel_id: 91,
-            latency_ms: 5,
-            bandwidth_bytes_per_ms: 10,
-            loss_every: Some(1),
-            down_windows: Vec::new(),
-        });
-        shell.add_link(SimLink {
-            from_node: 2,
-            from_channel_id: 22,
-            to_node: 9,
-            to_channel_id: 92,
-            latency_ms: 50,
-            bandwidth_bytes_per_ms: 10,
-            loss_every: None,
-            down_windows: vec![DownWindow {
-                start_ms: 0,
-                end_ms: 20,
-            }],
-        });
-
-        shell.set_channel_state(2, 21, ChannelState::Down);
-        shell.set_channel_state(2, 22, ChannelState::Up);
-        shell.send_transport(2, 22, vec![1, 2, 3]);
-        shell.run_until_idle(4);
-
-        assert_eq!(shell.metrics().sent_packets, 1);
-        assert_eq!(shell.metrics().dropped_packets, 1);
-    }
-
-    #[test]
-    fn test_shell_uses_full_route_plan_for_relay_hops() {
-        let mut shell = TestShell::new();
-        shell.add_endpoint(
-            endpoint_config(
-                1,
                 ENVELOPE_KEY,
                 MESSAGE_KEY,
                 [4; 16],
-                vec![11],
-                topology(vec![
-                    (1, vec![route_channel(11, 2)]),
-                    (2, vec![route_channel(22, 3)]),
-                    (3, Vec::new()),
+                0,
+                vec![41],
+                route_graph(vec![
+                    vec![route_edge(41, 1)],
+                    vec![route_edge(51, 2)],
+                    vec![],
                 ]),
-            ),
-            false,
-        );
-        shell.add_relay(relay_config(2, ENVELOPE_KEY, [2; 16], vec![21, 22]));
-        shell.add_endpoint(
-            endpoint_config(
-                3,
-                ENVELOPE_KEY,
-                MESSAGE_KEY,
-                [5; 16],
-                vec![31],
-                topology(vec![(3, vec![route_channel(31, 1)]), (1, Vec::new())]),
+                kcp_config(),
             ),
             true,
         );
-        shell.add_link(link(1, 11, 2, 201, 5, 100));
-        shell.add_link(link(2, 22, 3, 302, 35, 100));
-        shell.add_link(link(3, 31, 1, 101, 5, 100));
-
-        let conv_id = shell.open_ingress(
-            1,
-            Target {
-                host: "echo.invalid".to_string(),
-                port: 7,
-            },
-        );
-        shell.run_until_idle(64);
-        shell.send_session_bytes(1, conv_id, b"route".to_vec());
+        let mut broken = link(1, 11, 2, 201);
+        broken.down_windows.push(DownWindow {
+            start_ms: 0,
+            end_ms: u64::MAX,
+        });
+        shell.add_link(broken);
+        shell.add_link(link(2, 21, 4, 401));
+        shell.add_link(link(1, 12, 3, 301));
+        shell.add_link(link(3, 31, 4, 401));
+        shell.add_link(link(4, 41, 2, 202));
+        shell.add_link(link(2, 51, 1, 101));
+        shell.add_link(link(4, 41, 3, 302));
+        shell.add_link(link(3, 61, 1, 101));
+        let conv = shell.open_session(1);
         shell.run_until_idle(128);
-
-        assert_eq!(shell.session_bytes(1, conv_id), Some(&b"route"[..]));
-        assert_eq!(shell.delivered_on(2, 21), 0);
-        assert!(shell.delivered_on(2, 22) > 0);
+        shell.send_session_bytes(1, conv, b"route".to_vec());
+        shell.run_until_idle(256);
+        assert_eq!(shell.session_bytes(1, conv), Some(&b"route"[..]));
+        assert_eq!(shell.delivered_on(1, 11), 0);
+        assert!(shell.delivered_on(1, 12) > 0);
     }
 
     #[test]
-    fn test_shell_retransmits_with_virtual_time_after_disconnect() {
+    fn loss_recovers_and_replay_is_not_forwarded_twice() {
         let mut shell = TestShell::new();
         shell.add_endpoint(
+            1,
             endpoint_config(
-                1,
                 ENVELOPE_KEY,
-                [9; 16],
-                [6; 16],
+                MESSAGE_KEY,
+                [1; 16],
+                0,
                 vec![11],
-                topology(vec![(1, vec![route_channel(11, 2)]), (2, Vec::new())]),
+                route_graph(vec![
+                    vec![route_edge(11, 1)],
+                    vec![route_edge(21, 2)],
+                    vec![],
+                ]),
+                kcp_config(),
+            ),
+            false,
+        );
+        shell.add_relay(2, relay_config(ENVELOPE_KEY, [2; 16], 0, vec![21, 41]));
+        shell.add_endpoint(
+            3,
+            endpoint_config(
+                ENVELOPE_KEY,
+                MESSAGE_KEY,
+                [3; 16],
+                0,
+                vec![31],
+                route_graph(vec![
+                    vec![route_edge(31, 1)],
+                    vec![route_edge(41, 2)],
+                    vec![],
+                ]),
+                kcp_config(),
+            ),
+            true,
+        );
+        shell.add_link(link(1, 11, 2, 201));
+        shell.add_link(link(2, 21, 3, 301));
+        shell.add_link(link(3, 31, 2, 202));
+        shell.add_link(link(2, 41, 1, 101));
+        let conv = shell.open_session(1);
+        shell.run_until_idle(128);
+        let forwarded = shell.delivered_on(2, 21);
+        assert!(shell.replay_last_packet(1, 11));
+        shell.run_until_idle(32);
+        assert_eq!(shell.delivered_on(2, 21), forwarded);
+        shell.send_session_bytes(1, conv, b"hello".to_vec());
+        shell.run_until_idle(256);
+        assert_eq!(shell.session_bytes(1, conv), Some(&b"hello"[..]));
+    }
+
+    #[test]
+    fn scaled_kcp_recovers_after_a_slow_link_returns() {
+        let mut shell = TestShell::new();
+        let fast = kcp_config();
+        let mut slow = kcp_config();
+        slow.send_window = 96;
+        slow.receive_window = 256;
+        slow.time_scale = 5;
+        shell.add_endpoint(
+            1,
+            endpoint_config(
+                ENVELOPE_KEY,
+                MESSAGE_KEY,
+                [8; 16],
+                0,
+                vec![11],
+                route_graph(vec![vec![route_edge(11, 1)], vec![]]),
+                fast,
             ),
             false,
         );
         shell.add_endpoint(
+            2,
             endpoint_config(
-                2,
                 ENVELOPE_KEY,
+                MESSAGE_KEY,
                 [9; 16],
-                [7; 16],
+                0,
                 vec![21],
-                topology(vec![(2, vec![route_channel(21, 1)]), (1, Vec::new())]),
+                route_graph(vec![vec![route_edge(21, 1)], vec![]]),
+                slow,
             ),
             true,
         );
-        shell.add_link(SimLink {
-            from_node: 1,
-            from_channel_id: 11,
-            to_node: 2,
-            to_channel_id: 21,
-            latency_ms: 5,
-            bandwidth_bytes_per_ms: 100,
-            loss_every: None,
-            down_windows: vec![DownWindow {
-                start_ms: 0,
-                end_ms: 55,
-            }],
+        let mut forward = link(1, 11, 2, 21);
+        forward.latency_ms = 30;
+        forward.bandwidth_bytes_per_ms = 10;
+        forward.down_windows.push(DownWindow {
+            start_ms: 0,
+            end_ms: 55,
         });
-        shell.add_link(link(2, 21, 1, 11, 5, 100));
+        shell.add_link(forward);
+        shell.add_link(link(2, 21, 1, 11));
+        let conv = shell.open_session(1);
+        shell.run_until_idle(1024);
+        shell.send_session_bytes(1, conv, b"retry".to_vec());
+        shell.run_until_idle(1024);
+        assert_eq!(shell.session_bytes(1, conv), Some(&b"retry"[..]));
+        assert!(shell.metrics().dropped_packets > 0);
+    }
 
-        let conv_id = shell.open_ingress(
+    #[test]
+    fn restart_uses_fresh_seed_and_continuous_global_time() {
+        let mut shell = TestShell::new();
+        shell.add_relay(1, relay_config(ENVELOPE_KEY, [1; 16], 100, vec![11]));
+        shell.now_ms = 5_000;
+        shell.restart_node(1);
+
+        let SimNode::Relay {
+            config,
+            started_at_sim_ms,
+            ..
+        } = shell.nodes.get(&1).unwrap()
+        else {
+            panic!("node remains a relay");
+        };
+        assert_eq!(config.boot_time_ms, 5_100);
+        assert_ne!(config.random_seed, [1; 16]);
+        assert_eq!(*started_at_sim_ms, 5_000);
+        assert_eq!(shell.elapsed(1), 0);
+    }
+
+    #[test]
+    fn close_retransmits_after_first_close_is_dropped() {
+        let mut shell = TestShell::new();
+        let mut kcp = kcp_config();
+        kcp.time_scale = 1;
+        shell.add_endpoint(
             1,
-            Target {
-                host: "echo.invalid".to_string(),
-                port: 7,
+            endpoint_config(
+                ENVELOPE_KEY,
+                MESSAGE_KEY,
+                [11; 16],
+                0,
+                vec![11],
+                route_graph(vec![vec![route_edge(11, 1)], vec![]]),
+                kcp,
+            ),
+            false,
+        );
+        shell.add_endpoint(
+            2,
+            endpoint_config(
+                ENVELOPE_KEY,
+                MESSAGE_KEY,
+                [22; 16],
+                0,
+                vec![21],
+                route_graph(vec![vec![route_edge(21, 1)], vec![]]),
+                kcp_config(),
+            ),
+            true,
+        );
+        shell.add_link(link(1, 11, 2, 21));
+        shell.add_link(link(2, 21, 1, 11));
+
+        let conv = shell.open_session(1);
+        shell.run_until_idle(256);
+        assert!(shell.has_session(2, conv), "remote should open");
+        assert_eq!(shell.active_sessions(1), 1);
+        assert_eq!(shell.active_sessions(2), 1);
+
+        shell.close_session(1, conv, CloseReason::LocalClosed);
+        let dropped = shell.drop_queued_from(1, 11);
+        assert!(dropped > 0, "close should produce at least one packet");
+        assert_eq!(
+            shell.active_sessions(1),
+            1,
+            "local must keep session while close is unacked"
+        );
+
+        shell.run_until_idle(10_000);
+
+        assert_eq!(
+            shell.active_sessions(1),
+            0,
+            "local should finish after retransmit/ack now={} dropped={}",
+            shell.now_ms(),
+            shell.metrics().dropped_packets
+        );
+        assert_eq!(shell.active_sessions(2), 0, "remote must not leak session");
+        assert!(!shell.has_session(1, conv));
+        assert!(!shell.has_session(2, conv));
+    }
+
+    #[test]
+    fn same_seed_is_deterministic() {
+        fn run() -> (ConvId, TestMetrics, Option<Vec<u8>>) {
+            let mut shell = TestShell::new();
+            shell.add_endpoint(
+                1,
+                endpoint_config(
+                    ENVELOPE_KEY,
+                    MESSAGE_KEY,
+                    [42; 16],
+                    0,
+                    vec![11],
+                    route_graph(vec![vec![route_edge(11, 1)], vec![]]),
+                    kcp_config(),
+                ),
+                false,
+            );
+            shell.add_endpoint(
+                2,
+                endpoint_config(
+                    ENVELOPE_KEY,
+                    MESSAGE_KEY,
+                    [43; 16],
+                    0,
+                    vec![21],
+                    route_graph(vec![vec![route_edge(21, 1)], vec![]]),
+                    kcp_config(),
+                ),
+                true,
+            );
+            shell.add_link(link(1, 11, 2, 21));
+            shell.add_link(link(2, 21, 1, 11));
+            let conv = shell.open_session(1);
+            shell.run_until_idle(256);
+            shell.send_session_bytes(1, conv, b"det".to_vec());
+            shell.run_until_idle(256);
+            (
+                conv,
+                shell.metrics(),
+                shell.session_bytes(1, conv).map(|bytes| bytes.to_vec()),
+            )
+        }
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn malformed_packet_does_not_create_session_state() {
+        let mut shell = TestShell::new();
+        shell.add_endpoint(
+            1,
+            endpoint_config(
+                ENVELOPE_KEY,
+                MESSAGE_KEY,
+                [1; 16],
+                0,
+                vec![11],
+                route_graph(vec![vec![route_edge(11, 1)], vec![]]),
+                kcp_config(),
+            ),
+            false,
+        );
+        shell.handle_event(
+            1,
+            CoreEvent::TransportPacketReceived {
+                channel_id: 11,
+                bytes: vec![0u8; 64],
             },
         );
-        shell.run_until_idle(128);
-        shell.send_session_bytes(1, conv_id, b"retry".to_vec());
-        shell.run_until_idle(128);
-
-        assert_eq!(shell.session_bytes(1, conv_id), Some(&b"retry"[..]));
-        assert!(shell.metrics().dropped_packets > 0);
-        assert!(shell.now_ms() >= 55);
+        assert_eq!(shell.active_sessions(1), 0);
     }
 
     fn link(
-        from_node: NodeId,
+        from_node: SimNodeId,
         from_channel_id: ChannelId,
-        to_node: NodeId,
+        to_node: SimNodeId,
         to_channel_id: ChannelId,
-        latency_ms: u64,
-        bandwidth_bytes_per_ms: u64,
     ) -> SimLink {
         SimLink {
             from_node,
             from_channel_id,
             to_node,
             to_channel_id,
-            latency_ms,
-            bandwidth_bytes_per_ms,
+            latency_ms: 5,
+            bandwidth_bytes_per_ms: 100,
             loss_every: None,
+            extra_delay_ms: 0,
             down_windows: Vec::new(),
         }
     }

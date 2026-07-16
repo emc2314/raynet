@@ -1,300 +1,287 @@
-use std::collections::{BTreeMap, BTreeSet};
+use crate::limits::{LOCAL_COOLDOWN_INITIAL_MS, LOCAL_COOLDOWN_MAX_MS};
+use crate::machine::ChannelId;
 
-use crate::{ChannelId, ChannelState, NodeId, TransportMetrics};
+const DEFAULT_ROUTE_CAPACITY_KBPS: u32 = 50_000;
+const DEFAULT_ROUTE_LATENCY_MS: u32 = 50;
+const FIXED_ONE: u64 = 1 << 16;
+const LOSS_ONE: u32 = u16::MAX as u32;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RouteTopology {
+#[derive(Clone, PartialEq, Eq)]
+pub struct RouteConfig {
+    pub graph: RouteGraph,
+    pub min_mtu: u32,
+    pub feedback_interval_ms: u32,
+    pub feedback_timeout_ms: u32,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RouteGraph {
     pub nodes: Vec<RouteNode>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RouteNode {
-    pub node_id: NodeId,
-    pub channels: Vec<RouteChannel>,
+    pub edges: Vec<RouteEdge>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RouteChannel {
+#[derive(Clone, PartialEq, Eq)]
+pub struct RouteEdge {
     pub channel_id: ChannelId,
-    pub peer_node_id: NodeId,
+    pub next: u32,
+    pub capacity_hint_kbps: u32,
+    pub latency_hint_ms: u32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct RouteEdgeState {
-    pub node_id: NodeId,
-    pub channel_id: ChannelId,
-    pub peer_node_id: NodeId,
-    pub channel_state: ChannelState,
-    pub loss_ewma: f32,
-    pub probe_budget: u32,
-    pub last_update_ms: u64,
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct EdgeId {
+    node: usize,
+    edge: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct LocalChannelState {
-    pub channel_id: ChannelId,
-    pub state: ChannelState,
-    pub sent_packets: u64,
-    pub received_packets: u64,
-    pub send_errors: u64,
-    pub queue_pressure: f32,
+struct Edge {
+    channel_id: ChannelId,
+    next: usize,
+    capacity_kbps: u32,
+    latency_ms: u32,
+    virtual_free_at: u64,
+    loss: u32,
+    cooldown_until: u64,
+    retry_delay_ms: u64,
+    last_sampled: Option<u64>,
+    last_observation_at: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct LocalChannelTable {
-    channels: BTreeMap<ChannelId, LocalChannelState>,
-}
-
-impl LocalChannelTable {
-    pub fn new(channel_ids: impl IntoIterator<Item = ChannelId>) -> Self {
-        Self {
-            channels: channel_ids
-                .into_iter()
-                .map(|channel_id| {
-                    (
-                        channel_id,
-                        LocalChannelState {
-                            channel_id,
-                            state: ChannelState::Up,
-                            sent_packets: 0,
-                            received_packets: 0,
-                            send_errors: 0,
-                            queue_pressure: 0.0,
-                        },
-                    )
-                })
-                .collect(),
-        }
-    }
-
-    pub fn contains(&self, channel_id: ChannelId) -> bool {
-        self.channels.contains_key(&channel_id)
-    }
-
-    pub fn is_usable(&self, channel_id: ChannelId) -> bool {
-        self.channels.get(&channel_id).is_some_and(|channel| {
-            matches!(channel.state, ChannelState::Up | ChannelState::Degraded)
-        })
-    }
-
-    pub fn record_send(&mut self, channel_id: ChannelId) {
-        if let Some(channel) = self.channels.get_mut(&channel_id) {
-            channel.sent_packets = channel.sent_packets.saturating_add(1);
-        }
-    }
-
-    pub fn record_receive(&mut self, channel_id: ChannelId) {
-        if let Some(channel) = self.channels.get_mut(&channel_id) {
-            channel.received_packets = channel.received_packets.saturating_add(1);
-        }
-    }
-
-    pub fn update_channel(
-        &mut self,
-        channel_id: ChannelId,
-        state: ChannelState,
-        metrics: TransportMetrics,
-    ) {
-        if let Some(channel) = self.channels.get_mut(&channel_id) {
-            channel.state = state;
-            channel.queue_pressure = metrics.queue_pressure;
-            if metrics.send_error {
-                channel.send_errors = channel.send_errors.saturating_add(1);
-            }
-        }
-    }
-
-    pub fn channel_ids(&self) -> impl Iterator<Item = ChannelId> + '_ {
-        self.channels.keys().copied()
-    }
-
-    pub fn states(&self) -> impl Iterator<Item = &LocalChannelState> {
-        self.channels.values()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RoutePlanner {
-    topology: RouteTopology,
-    edge_states: BTreeMap<(NodeId, ChannelId), RouteEdgeState>,
+pub(crate) struct RoutePlanner {
+    nodes: Vec<Vec<Edge>>,
 }
 
 impl RoutePlanner {
-    pub fn new(topology: RouteTopology) -> Self {
-        let edge_states = topology
+    pub(crate) fn new(config: &RouteConfig) -> Self {
+        let nodes = config
+            .graph
             .nodes
             .iter()
-            .flat_map(|node| {
-                node.channels.iter().map(|channel| {
-                    (
-                        (node.node_id, channel.channel_id),
-                        RouteEdgeState {
-                            node_id: node.node_id,
-                            channel_id: channel.channel_id,
-                            peer_node_id: channel.peer_node_id,
-                            channel_state: ChannelState::Up,
-                            loss_ewma: 0.0,
-                            probe_budget: 0,
-                            last_update_ms: 0,
+            .map(|node| {
+                node.edges
+                    .iter()
+                    .map(|edge| Edge {
+                        channel_id: edge.channel_id,
+                        next: edge.next as usize,
+                        capacity_kbps: if edge.capacity_hint_kbps == 0 {
+                            DEFAULT_ROUTE_CAPACITY_KBPS
+                        } else {
+                            edge.capacity_hint_kbps
                         },
-                    )
-                })
+                        latency_ms: if edge.latency_hint_ms == 0 {
+                            DEFAULT_ROUTE_LATENCY_MS
+                        } else {
+                            edge.latency_hint_ms
+                        },
+                        virtual_free_at: 0,
+                        loss: 0,
+                        cooldown_until: 0,
+                        retry_delay_ms: LOCAL_COOLDOWN_INITIAL_MS,
+                        last_sampled: None,
+                        last_observation_at: None,
+                    })
+                    .collect()
             })
             .collect();
-
-        Self {
-            topology,
-            edge_states,
-        }
+        Self { nodes }
     }
 
-    pub fn topology(&self) -> &RouteTopology {
-        &self.topology
-    }
-
-    pub fn edge_states(&self) -> impl Iterator<Item = &RouteEdgeState> {
-        self.edge_states.values()
-    }
-
-    pub fn update_edge(
+    pub(crate) fn build_route_plan(
         &mut self,
-        node_id: NodeId,
-        channel_id: ChannelId,
-        state: ChannelState,
-        metrics: TransportMetrics,
-        now_ms: u64,
-    ) {
-        if let Some(edge) = self.edge_states.get_mut(&(node_id, channel_id)) {
-            edge.channel_state = state;
-            edge.last_update_ms = now_ms;
-            if metrics.send_error || state == ChannelState::Down {
-                edge.loss_ewma = edge.loss_ewma * 0.6 + 0.4;
-                edge.probe_budget = edge.probe_budget.saturating_add(1).min(8);
-            } else {
-                edge.loss_ewma *= 0.9;
-                edge.probe_budget = edge.probe_budget.saturating_sub(1);
-            }
-        }
-    }
-
-    pub fn record_success(&mut self, node_id: NodeId, channel_id: ChannelId, now_ms: u64) {
-        if let Some(edge) = self.edge_states.get_mut(&(node_id, channel_id)) {
-            edge.loss_ewma *= 0.95;
-            edge.last_update_ms = now_ms;
-        }
-    }
-
-    pub fn build_route_plan(
-        &self,
-        local_node_id: NodeId,
-        local_channels: &LocalChannelTable,
+        elapsed_ms: u64,
+        scheduled_bytes: usize,
+        sample: bool,
     ) -> Option<Vec<ChannelId>> {
-        let destination = self.destination_node_id(local_node_id)?;
-        let mut best_cost: BTreeMap<NodeId, f32> = BTreeMap::new();
-        let mut previous: BTreeMap<NodeId, (NodeId, ChannelId)> = BTreeMap::new();
-        let mut unvisited: BTreeSet<NodeId> = self
-            .topology
-            .nodes
-            .iter()
-            .map(|node| node.node_id)
-            .collect();
+        let forced = if sample {
+            Some(self.sampling_edge(elapsed_ms)?)
+        } else {
+            None
+        };
+        let edge_ids = self.calculate_path(elapsed_ms, scheduled_bytes, forced)?;
 
-        best_cost.insert(local_node_id, 0.0);
+        self.reserve(&edge_ids, elapsed_ms, scheduled_bytes, sample);
+        Some(
+            edge_ids
+                .into_iter()
+                .map(|edge| self.nodes[edge.node][edge.edge].channel_id)
+                .collect(),
+        )
+    }
 
-        while !unvisited.is_empty() {
-            let Some((&node_id, &cost)) = best_cost
-                .iter()
-                .filter(|(node_id, _)| unvisited.contains(node_id))
-                .min_by(|(_, left), (_, right)| left.total_cmp(right))
-            else {
-                break;
-            };
-            unvisited.remove(&node_id);
-
-            if node_id == destination {
-                break;
-            }
-
-            let Some(node) = self.node(node_id) else {
+    fn sampling_edge(&self, elapsed_ms: u64) -> Option<EdgeId> {
+        let destination = self.nodes.len() - 1;
+        let mut reachable = vec![false; self.nodes.len()];
+        reachable[0] = true;
+        let mut selected = None;
+        let mut node = 0;
+        while node < destination {
+            if !reachable[node] {
+                node += 1;
                 continue;
-            };
-            for channel in &node.channels {
-                if node_id == local_node_id && !local_channels.is_usable(channel.channel_id) {
+            }
+            for edge in 0..self.nodes[node].len() {
+                let edge_id = EdgeId { node, edge };
+                if !self.edge_allowed(edge_id, elapsed_ms) {
                     continue;
                 }
-                let next_cost = cost + self.edge_cost(node_id, channel.channel_id);
-                if next_cost
-                    < best_cost
-                        .get(&channel.peer_node_id)
-                        .copied()
-                        .unwrap_or(f32::INFINITY)
-                {
-                    best_cost.insert(channel.peer_node_id, next_cost);
-                    previous.insert(channel.peer_node_id, (node_id, channel.channel_id));
+                reachable[self.nodes[node][edge].next] = true;
+                if selected.is_none_or(|selected: EdgeId| {
+                    self.nodes[node][edge].last_sampled
+                        < self.nodes[selected.node][selected.edge].last_sampled
+                }) {
+                    selected = Some(edge_id);
+                }
+            }
+            node += 1;
+        }
+        selected
+    }
+
+    pub(crate) fn note_local_send_failure(&mut self, channel_id: ChannelId, elapsed_ms: u64) {
+        let edge = self.nodes[0]
+            .iter()
+            .position(|edge| edge.channel_id == channel_id)
+            .unwrap();
+        let runtime = &mut self.nodes[0][edge];
+        if runtime
+            .last_observation_at
+            .is_none_or(|last| elapsed_ms >= last)
+        {
+            runtime.loss += (LOSS_ONE - runtime.loss) / 2;
+            runtime.last_observation_at = Some(elapsed_ms);
+        }
+        runtime.cooldown_until = elapsed_ms + runtime.retry_delay_ms;
+        runtime.retry_delay_ms = (runtime.retry_delay_ms * 2).min(LOCAL_COOLDOWN_MAX_MS);
+    }
+
+    pub(crate) fn note_feedback(&mut self, plan: &[ChannelId], observation_at: u64, success: bool) {
+        let mut node = 0;
+        let mut first = None;
+        let mut accepted_first = false;
+        for channel in plan {
+            let edge = self.nodes[node]
+                .iter()
+                .position(|edge| edge.channel_id == *channel)
+                .unwrap();
+            let edge_id = EdgeId { node, edge };
+            let is_first = first.is_none();
+            first.get_or_insert(edge_id);
+            node = self.nodes[node][edge].next;
+
+            let runtime = &mut self.nodes[edge_id.node][edge_id.edge];
+            if runtime
+                .last_observation_at
+                .is_some_and(|last| observation_at < last)
+            {
+                continue;
+            }
+            runtime.loss = if success {
+                runtime.loss * 3 / 4
+            } else {
+                runtime.loss + (LOSS_ONE - runtime.loss) / 16
+            };
+            runtime.last_observation_at = Some(observation_at);
+            accepted_first |= is_first;
+        }
+        if success && accepted_first {
+            let first = first.unwrap();
+            let runtime = &mut self.nodes[first.node][first.edge];
+            runtime.cooldown_until = 0;
+            runtime.retry_delay_ms = LOCAL_COOLDOWN_INITIAL_MS;
+        }
+    }
+
+    fn calculate_path(
+        &self,
+        elapsed_ms: u64,
+        scheduled_bytes: usize,
+        forced: Option<EdgeId>,
+    ) -> Option<Vec<EdgeId>> {
+        let destination = self.nodes.len() - 1;
+        let mut arrival = vec![[u64::MAX; 2]; self.nodes.len()];
+        let mut predecessor = vec![[None; 2]; self.nodes.len()];
+        arrival[0][0] = elapsed_ms * FIXED_ONE;
+
+        for node in 0..destination {
+            for state in 0..=usize::from(forced.is_some()) {
+                let node_arrival = arrival[node][state];
+                if node_arrival == u64::MAX {
+                    continue;
+                }
+                for edge_index in 0..self.nodes[node].len() {
+                    let edge_id = EdgeId {
+                        node,
+                        edge: edge_index,
+                    };
+                    if !self.edge_allowed(edge_id, elapsed_ms) {
+                        continue;
+                    }
+                    let edge = &self.nodes[node][edge_index];
+                    let next_state = state | usize::from(forced == Some(edge_id));
+                    let start = node_arrival.max(edge.virtual_free_at);
+                    let candidate = start
+                        + self.serialization_time(edge_id, scheduled_bytes)
+                        + self.latency(edge_id);
+                    let next = edge.next;
+                    if candidate < arrival[next][next_state] {
+                        arrival[next][next_state] = candidate;
+                        predecessor[next][next_state] = Some((state, edge_id));
+                    }
                 }
             }
         }
 
-        if !previous.contains_key(&destination) {
+        let mut state = usize::from(forced.is_some());
+        if arrival[destination][state] == u64::MAX {
             return None;
         }
-
-        let mut node_id = destination;
-        let mut route_plan = Vec::new();
-        while node_id != local_node_id {
-            let (prev_node_id, channel_id) = previous.get(&node_id).copied()?;
-            route_plan.push(channel_id);
-            node_id = prev_node_id;
+        let mut node = destination;
+        let mut path = Vec::new();
+        while node != 0 {
+            let (previous_state, edge) = predecessor[node][state]?;
+            path.push(edge);
+            node = edge.node;
+            state = previous_state;
         }
-        route_plan.reverse();
-        Some(route_plan)
+        path.reverse();
+        Some(path)
     }
 
-    fn destination_node_id(&self, local_node_id: NodeId) -> Option<NodeId> {
-        let source_nodes: BTreeSet<_> = self
-            .topology
-            .nodes
-            .iter()
-            .map(|node| node.node_id)
-            .collect();
-        let referenced_nodes: BTreeSet<_> = self
-            .topology
-            .nodes
-            .iter()
-            .flat_map(|node| node.channels.iter().map(|channel| channel.peer_node_id))
-            .collect();
-
-        let mut sinks: Vec<_> = referenced_nodes
-            .into_iter()
-            .filter(|node_id| *node_id != local_node_id)
-            .filter(|node_id| {
-                self.node(*node_id)
-                    .is_none_or(|node| node.channels.is_empty())
-                    || !source_nodes.contains(node_id)
-            })
-            .collect();
-        sinks.sort_unstable();
-        sinks.dedup();
-        if sinks.len() == 1 { sinks.pop() } else { None }
+    fn edge_allowed(&self, edge_id: EdgeId, elapsed_ms: u64) -> bool {
+        elapsed_ms >= self.nodes[edge_id.node][edge_id.edge].cooldown_until
     }
 
-    fn edge_cost(&self, node_id: NodeId, channel_id: ChannelId) -> f32 {
-        let Some(edge) = self.edge_states.get(&(node_id, channel_id)) else {
-            return f32::INFINITY;
-        };
-        let down_penalty = match edge.channel_state {
-            ChannelState::Up => 0.0,
-            ChannelState::Degraded => 10.0,
-            ChannelState::Down => 1_000_000.0,
-        };
-        1.0 + edge.loss_ewma * 100.0 + down_penalty
+    fn reserve(&mut self, path: &[EdgeId], elapsed_ms: u64, scheduled_bytes: usize, sample: bool) {
+        let mut cursor = elapsed_ms * FIXED_ONE;
+        for &edge in path {
+            let start = cursor.max(self.nodes[edge.node][edge.edge].virtual_free_at);
+            let finished = start + self.serialization_time(edge, scheduled_bytes);
+            let latency = self.latency(edge);
+            let runtime = &mut self.nodes[edge.node][edge.edge];
+            runtime.virtual_free_at = finished;
+            if sample {
+                runtime.last_sampled = Some(elapsed_ms);
+            }
+            cursor = finished + latency;
+        }
     }
 
-    fn node(&self, node_id: NodeId) -> Option<&RouteNode> {
-        self.topology
-            .nodes
-            .iter()
-            .find(|node| node.node_id == node_id)
+    fn serialization_time(&self, edge_id: EdgeId, bytes: usize) -> u64 {
+        let edge = &self.nodes[edge_id.node][edge_id.edge];
+        let capacity = u64::from(edge.capacity_kbps);
+        let loss = u64::from(edge.loss);
+        let penalty = FIXED_ONE + 15 * loss * loss * FIXED_ONE / u64::from(LOSS_ONE).pow(2);
+        let effective_capacity = (capacity * FIXED_ONE / penalty).max(1);
+        (bytes as u64 * 8 * FIXED_ONE).div_ceil(effective_capacity)
+    }
+
+    fn latency(&self, edge_id: EdgeId) -> u64 {
+        let latency = u64::from(self.nodes[edge_id.node][edge_id.edge].latency_ms);
+        latency * FIXED_ONE
     }
 }
 
@@ -302,46 +289,73 @@ impl RoutePlanner {
 mod tests {
     use super::*;
 
-    fn channel(channel_id: ChannelId, peer_node_id: NodeId) -> RouteChannel {
-        RouteChannel {
-            channel_id,
-            peer_node_id,
+    fn graph_two_local_edges() -> RouteConfig {
+        RouteConfig {
+            graph: RouteGraph {
+                nodes: vec![
+                    RouteNode {
+                        edges: vec![
+                            RouteEdge {
+                                channel_id: 2,
+                                next: 1,
+                                capacity_hint_kbps: 0,
+                                latency_hint_ms: 0,
+                            },
+                            RouteEdge {
+                                channel_id: 1,
+                                next: 1,
+                                capacity_hint_kbps: 0,
+                                latency_hint_ms: 0,
+                            },
+                        ],
+                    },
+                    RouteNode { edges: Vec::new() },
+                ],
+            },
+            min_mtu: 1200,
+            feedback_interval_ms: 1_000,
+            feedback_timeout_ms: 5_000,
         }
     }
 
     #[test]
-    fn route_planner_builds_low_cost_route_plan_without_enumerating_routes() {
-        let mut planner = RoutePlanner::new(RouteTopology {
-            nodes: vec![
-                RouteNode {
-                    node_id: 1,
-                    channels: vec![channel(11, 2), channel(12, 3)],
-                },
-                RouteNode {
-                    node_id: 2,
-                    channels: vec![channel(21, 4)],
-                },
-                RouteNode {
-                    node_id: 3,
-                    channels: vec![channel(31, 4)],
-                },
-            ],
-        });
-        planner.update_edge(
-            1,
-            11,
-            ChannelState::Down,
-            TransportMetrics {
-                queue_pressure: 1.0,
-                send_error: true,
-            },
-            10,
-        );
-        let local_channels = LocalChannelTable::new([11, 12]);
+    fn equal_routes_use_graph_order() {
+        let config = graph_two_local_edges();
+        let mut planner = RoutePlanner::new(&config);
+        assert_eq!(planner.build_route_plan(0, 100, false), Some(vec![2]));
+    }
 
-        assert_eq!(
-            planner.build_route_plan(1, &local_channels),
-            Some(vec![12, 31])
-        );
+    #[test]
+    fn failed_local_edge_enters_exponential_cooldown() {
+        let config = graph_two_local_edges();
+        let mut planner = RoutePlanner::new(&config);
+        planner.note_local_send_failure(2, 0);
+        assert_eq!(planner.build_route_plan(1, 100, true), Some(vec![1]));
+        assert_eq!(planner.build_route_plan(49, 100, false), Some(vec![1]));
+        assert_eq!(planner.build_route_plan(50, 100, false), Some(vec![1]));
+    }
+
+    #[test]
+    fn sampling_rotates_across_edges() {
+        let config = graph_two_local_edges();
+        let mut planner = RoutePlanner::new(&config);
+        assert_eq!(planner.build_route_plan(0, 100, true), Some(vec![2]));
+        assert_eq!(planner.build_route_plan(1, 100, true), Some(vec![1]));
+    }
+
+    #[test]
+    fn virtual_service_time_spreads_work() {
+        let mut config = graph_two_local_edges();
+        config.graph.nodes[0].edges[0].capacity_hint_kbps = 1_000;
+        config.graph.nodes[0].edges[0].latency_hint_ms = 1;
+        config.graph.nodes[0].edges[1].capacity_hint_kbps = 100_000;
+        config.graph.nodes[0].edges[1].latency_hint_ms = 10;
+        let mut planner = RoutePlanner::new(&config);
+        assert_eq!(planner.build_route_plan(0, 1_000, false), Some(vec![2]));
+        let mut used_fast = false;
+        for _ in 0..20 {
+            used_fast |= planner.build_route_plan(0, 1_000, false) == Some(vec![1]);
+        }
+        assert!(used_fast);
     }
 }

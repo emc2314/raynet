@@ -4,20 +4,24 @@ version.workspace = true
 edition.workspace = true
 
 [features]
+default = ["channel-udp", "proxy-socks5"]
 fastack-conserve = ["raynet-core/fastack-conserve"]
+channel-udp = ["raynet-shell-plugins/channel-udp"]
+proxy-socks5 = ["raynet-shell-plugins/proxy-socks5"]
 
 [[bin]]
 name = "raynet"
 path = "src/main.rs"
+required-features = ["channel-udp", "proxy-socks5"]
 
 [dependencies]
 raynet-core = { path = "../raynet-core" }
+raynet-shell-plugins = { path = "../raynet-shell-plugins", default-features = false }
 
 aegis.workspace = true
 blake3.workspace = true
 clap.workspace = true
 env_logger.workspace = true
-futures.workspace = true
 log.workspace = true
 mimalloc.workspace = true
 rand.workspace = true

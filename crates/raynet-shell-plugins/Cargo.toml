@@ -1,0 +1,16 @@
+[package]
+name = "raynet-shell-plugins"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["channel-udp", "proxy-socks5"]
+channel-udp = []
+proxy-socks5 = []
+
+[dependencies]
+raynet-core = { path = "../raynet-core" }
+
+blake3.workspace = true
+rand.workspace = true
+tokio.workspace = true

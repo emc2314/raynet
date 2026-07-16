@@ -1,51 +1,66 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use raynet_core::ChannelId;
-use std::net::{SocketAddr, ToSocketAddrs};
+use raynet_shell_plugins::{ChannelReceiver, ChannelSender};
+use tokio::sync::mpsc;
 
-#[derive(Debug, Clone)]
-pub struct UdpChannel {
+use crate::transport::OutboundTransportPacket;
+
+pub struct InboundTransportPacket {
     pub channel_id: ChannelId,
-    pub addr: SocketAddr,
+    pub bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
-pub struct UdpChannels {
-    channels: Vec<UdpChannel>,
-}
+pub struct ChannelSenders(BTreeMap<ChannelId, ChannelSender>);
 
-impl UdpChannels {
-    pub fn from_names(names: Vec<String>) -> Self {
-        let channels = names
-            .into_iter()
-            .enumerate()
-            .map(|(index, name)| UdpChannel {
-                channel_id: index as ChannelId + 1,
-                addr: name
-                    .to_socket_addrs()
-                    .expect("Unable to resolve send address")
-                    .next()
-                    .unwrap(),
+impl ChannelSenders {
+    pub fn channel_ids(&self) -> Vec<ChannelId> {
+        self.0.keys().copied().collect()
+    }
+
+    pub async fn send(
+        &self,
+        packet: OutboundTransportPacket,
+    ) -> Result<(), OutboundTransportPacket> {
+        let Some(sender) = self.0.get(&packet.channel_id) else {
+            return Err(packet);
+        };
+        sender
+            .send(packet.bytes)
+            .await
+            .map_err(|bytes| OutboundTransportPacket {
+                channel_id: packet.channel_id,
+                bytes,
             })
-            .collect();
-
-        Self { channels }
     }
+}
 
-    pub fn addr(&self, channel_id: ChannelId) -> Option<SocketAddr> {
-        self.channels
-            .iter()
-            .find(|channel| channel.channel_id == channel_id)
-            .map(|channel| channel.addr)
+pub fn channels(
+    senders: Vec<ChannelSender>,
+    receivers: Vec<ChannelReceiver>,
+) -> (Arc<ChannelSenders>, mpsc::Receiver<InboundTransportPacket>) {
+    let mut by_id = BTreeMap::new();
+    for sender in senders {
+        assert!(by_id.insert(sender.channel_id(), sender).is_none());
     }
-
-    pub fn channel_id_for_addr(&self, addr: SocketAddr) -> Option<ChannelId> {
-        let ip = addr.ip().to_canonical();
-        self.channels
-            .iter()
-            .find(|channel| channel.addr == addr || channel.addr.ip().to_canonical() == ip)
-            .map(|channel| channel.channel_id)
+    let (tx, rx) = mpsc::channel(256);
+    for mut receiver in receivers {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            while let Some(bytes) = receiver.recv().await {
+                if tx
+                    .send(InboundTransportPacket {
+                        channel_id: receiver.channel_id(),
+                        bytes,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
     }
-
-    pub fn channel_ids(&self) -> impl Iterator<Item = ChannelId> + '_ {
-        self.channels.iter().map(|channel| channel.channel_id)
-    }
+    (Arc::new(ChannelSenders(by_id)), rx)
 }

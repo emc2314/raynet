@@ -1,17 +1,20 @@
 //! Runtime-independent RayNet protocol building blocks.
 
-pub mod core;
-pub mod kcp;
-pub mod routing;
-pub mod utils;
+mod endpoint;
+pub(crate) mod kcp;
+mod limits;
+mod machine;
+mod packet;
+mod random;
+mod relay;
+mod routing;
+mod sequence;
+mod wire;
 
-pub use core::{
-    ChannelId, ChannelState, CloseReason, ConfigError, ConvId, CoreAction, CoreError, CoreEvent,
-    CoreStructuredEvent, EndpointConfig, EndpointCore, Envelope, HopPacketError, Metadata, Metric,
-    NodeId, NonceFilter, OpenFailureReason, RandomStream, RelayConfig, RelayCore, RoutePlan,
-    SessionFrame, Target, TransportMetrics, WireError, open_hop_payload, seal_hop_payload,
+pub use endpoint::{EndpointConfig, EndpointCore, KcpConfig};
+pub use limits::MAX_SESSION_DATA_SIZE;
+pub use machine::{
+    ChannelId, CloseReason, ConvId, CoreAction, CoreEvent, CoreEventResult, CoreMetrics,
 };
-pub use routing::{
-    LocalChannelState, LocalChannelTable, RouteChannel, RouteEdgeState, RouteNode, RoutePlanner,
-    RouteTopology,
-};
+pub use relay::{RelayConfig, RelayCore};
+pub use routing::{RouteConfig, RouteEdge, RouteGraph, RouteNode};
