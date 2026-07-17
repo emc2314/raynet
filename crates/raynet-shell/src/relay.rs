@@ -4,17 +4,19 @@ use rand::RngExt;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::channels::{ChannelSenders, InboundTransportPacket};
+use crate::channels::Channels;
+use crate::config::RelayCoreTuning;
 use crate::remote::{forward_in, forward_out};
 use crate::transport::OutboundTransportPacket;
 use crate::utils::CoreClock;
 use raynet_core::{RelayConfig, RelayCore};
 
-pub fn run(
-    channels: Arc<ChannelSenders>,
-    channel_receiver: mpsc::Receiver<InboundTransportPacket>,
-    envelope_key: Key,
-) {
+pub fn run(channels: Channels, envelope_key: Key, tuning: RelayCoreTuning) {
+    let Channels {
+        senders: channels,
+        receiver: channel_receiver,
+        failures,
+    } = channels;
     let (ray_tx, ray_rx) = mpsc::channel::<OutboundTransportPacket>(65536);
     let clock = Arc::new(CoreClock::new());
     let random_seed = rand::rng().random();
@@ -23,7 +25,7 @@ pub fn run(
         random_seed,
         boot_time_ms: clock.boot_time_ms(),
         local_channels: channels.channel_ids(),
-        local_min_mtu: 1200,
+        local_min_mtu: tuning.local_min_mtu,
     })));
 
     {
@@ -36,7 +38,7 @@ pub fn run(
     }
 
     tokio::spawn(async move {
-        forward_out(ray_rx, channels, move |packet| {
+        forward_out(ray_rx, failures, channels, move |packet| {
             let relay_core = relay_core.clone();
             let clock = clock.clone();
             async move {

@@ -1,7 +1,7 @@
 mod channel;
 mod proxy;
 
-pub use channel::{ChannelReceiver, ChannelSender};
+pub use channel::{ChannelReceiver, ChannelSendFailure, ChannelSender};
 pub use proxy::{ProxyListener, ProxyMessage, ProxyPlugin, ProxySession};
 
 #[cfg(feature = "channel-udp")]

@@ -833,7 +833,7 @@ MAX_TRANSPORT_PACKET_SIZE = 64 KiB
 
 `MAX_SESSION_DATA_SIZE` 作用于 KCP reassembly 之后的一份应用数据消息。一份最大 SessionMessage 可以分成多个 KCP segment 和多份 TransportPacket；一份 TransportPacket 也可以聚合多个较小的 KCP segment。两个 64 KiB 上限分别约束重组后的逻辑消息和重组前的单个外层 packet，互不推导。
 
-KCP 始终使用本地单调 `elapsed_ms`。`time_scale` 缩放 KCP 的 update interval、RTO 下限等时间参数，而不是缩放时钟。KCP session 构造时一次性接收 MTU、窗口、`nodelay`、fast-resend threshold、是否启用 congestion control 和 `time_scale`；这些参数在 session 生命周期内不可改变。RayNet 固定使用 `nodelay = true`、启用原生 KCP congestion control，并用 `NonZeroU32::new(KcpConfig.fast_resend)` 得到可选 threshold；参考 shell 默认使用 `32`。
+KCP 始终使用本地单调 `elapsed_ms`。Endpoint session driver 在每次 KCP input 时传入本次 event 的 `elapsed_ms`，使 ACK RTT 计算不依赖上一次 poll/send 留下的旧时间；input 更新时间采样但不因此触发 timer flush。`time_scale` 缩放 KCP 的 update interval、RTO 下限等时间参数，而不是缩放时钟。KCP session 构造时一次性接收 MTU、窗口、`nodelay`、fast-resend threshold、是否启用 congestion control 和 `time_scale`；这些参数在 session 生命周期内不可改变。RayNet 固定使用 `nodelay = true`、关闭原生 KCP congestion control，并用 `NonZeroU32::new(KcpConfig.fast_resend)` 得到可选 threshold；参考 shell 默认使用 `32`。
 
 KCP 构造时把 `time_scale` 提升为 `u32`，并直接计算以下毫秒参数：
 

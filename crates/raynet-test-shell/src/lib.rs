@@ -14,10 +14,24 @@ pub struct SimLink {
     pub to_node: SimNodeId,
     pub to_channel_id: ChannelId,
     pub latency_ms: u64,
+    /// Zero means no serialization delay.
     pub bandwidth_bytes_per_ms: u64,
-    pub loss_every: Option<u64>,
+    pub loss: LossModel,
     pub extra_delay_ms: u64,
     pub down_windows: Vec<DownWindow>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub enum LossModel {
+    #[default]
+    None,
+    Every {
+        packets: u64,
+    },
+    Bernoulli {
+        loss_ppm: u32,
+        seed: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -178,12 +192,13 @@ impl TestShell {
         result
     }
 
+    /// Returns `true` when the write was fully accepted by core.
     pub fn send_session_bytes(
         &mut self,
         node_id: SimNodeId,
         conv_id: ConvId,
         bytes: impl Into<Vec<u8>>,
-    ) {
+    ) -> bool {
         let bytes = bytes.into();
         let mut actions = Vec::new();
         let elapsed_ms = self.elapsed(node_id);
@@ -218,6 +233,7 @@ impl TestShell {
             "unexpected SessionWrite result"
         );
         self.handle_actions(node_id, actions);
+        matches!(result, CoreEventResult::None)
     }
 
     pub fn close_session(&mut self, node_id: SimNodeId, conv_id: ConvId, reason: CloseReason) {
@@ -259,6 +275,14 @@ impl TestShell {
         self.delivered_by_outbound_channel
             .get(&(node_id, channel_id))
             .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn attempted_on(&self, node_id: SimNodeId, channel_id: ChannelId) -> u64 {
+        self.links
+            .iter()
+            .position(|link| link.from_node == node_id && link.from_channel_id == channel_id)
+            .map(|index| self.link_attempts[index])
             .unwrap_or(0)
     }
 
@@ -451,7 +475,11 @@ impl TestShell {
             .entry((node_id, channel_id))
             .or_insert(self.now_ms);
         let starts_at = (*next).max(self.now_ms);
-        let transmit_ms = (bytes.len() as u64).div_ceil(link.bandwidth_bytes_per_ms.max(1));
+        let transmit_ms = if link.bandwidth_bytes_per_ms == 0 {
+            0
+        } else {
+            (bytes.len() as u64).div_ceil(link.bandwidth_bytes_per_ms)
+        };
         *next = starts_at.saturating_add(transmit_ms);
         let packet = ScheduledPacket {
             due_ms: starts_at
@@ -558,9 +586,24 @@ impl SimLink {
             .any(|window| now_ms >= window.start_ms && now_ms < window.end_ms)
     }
     fn should_drop(&self, sent_packets: u64) -> bool {
-        self.loss_every
-            .is_some_and(|every| sent_packets.is_multiple_of(every))
+        match self.loss {
+            LossModel::None => false,
+            LossModel::Every { packets } => sent_packets.is_multiple_of(packets),
+            LossModel::Bernoulli { loss_ppm, seed } => {
+                assert!(loss_ppm <= 1_000_000);
+                let random = splitmix64(seed.wrapping_add(sent_packets));
+                let sample = ((u128::from(random) * 1_000_000) >> 64) as u32;
+                sample < loss_ppm
+            }
+        }
     }
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
 }
 
 pub fn route_edge(channel_id: ChannelId, next: u32) -> RouteEdge {
@@ -927,6 +970,28 @@ mod tests {
     }
 
     #[test]
+    fn seeded_bernoulli_loss_is_deterministic() {
+        let mut first = link(1, 11, 2, 21);
+        first.loss = LossModel::Bernoulli {
+            loss_ppm: 100_000,
+            seed: 42,
+        };
+        let second = first.clone();
+        let first_outcomes = (1..=10_000)
+            .map(|attempt| first.should_drop(attempt))
+            .collect::<Vec<_>>();
+        let second_outcomes = (1..=10_000)
+            .map(|attempt| second.should_drop(attempt))
+            .collect::<Vec<_>>();
+        assert_eq!(first_outcomes, second_outcomes);
+        let dropped = first_outcomes
+            .into_iter()
+            .filter(|dropped| *dropped)
+            .count();
+        assert!((900..=1_100).contains(&dropped));
+    }
+
+    #[test]
     fn malformed_packet_does_not_create_session_state() {
         let mut shell = TestShell::new();
         shell.add_endpoint(
@@ -965,7 +1030,7 @@ mod tests {
             to_channel_id,
             latency_ms: 5,
             bandwidth_bytes_per_ms: 100,
-            loss_every: None,
+            loss: LossModel::None,
             extra_delay_ms: 0,
             down_windows: Vec::new(),
         }

@@ -9,7 +9,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Instant, interval};
 
-use crate::channel::SendPacket;
+use crate::channel::{ChannelSendFailure, SendPacket};
 use crate::{ChannelReceiver, ChannelSender};
 
 const QUEUE_SIZE: usize = 256;
@@ -23,6 +23,7 @@ impl ForwardUdp {
         channel_id: ChannelId,
         binds: Vec<SocketAddr>,
         destinations: Vec<SocketAddr>,
+        failures: mpsc::Sender<ChannelSendFailure>,
     ) -> io::Result<ChannelSender> {
         assert!(!destinations.is_empty());
         let sockets = bind_all(binds).await?;
@@ -32,11 +33,9 @@ impl ForwardUdp {
             while let Some(packet) = rx.recv().await {
                 let socket = &sockets[rand::random_range(..sockets.len())];
                 let destination = destinations[rand::random_range(..destinations.len())];
-                let result = match socket.send_to(&packet.bytes, destination).await {
-                    Ok(_) => Ok(()),
-                    Err(_) => Err(packet.bytes),
-                };
-                let _ = packet.result.send(result);
+                if socket.send_to(&packet.bytes, destination).await.is_err() {
+                    let _ = failures.send((channel_id, packet.bytes)).await;
+                }
             }
         });
         Ok(ChannelSender::new(channel_id, tx))
@@ -57,6 +56,7 @@ impl ReverseUdp {
         channel_id: ChannelId,
         binds: Vec<SocketAddr>,
         channel_key: [u8; 32],
+        failures: mpsc::Sender<ChannelSendFailure>,
     ) -> io::Result<ChannelSender> {
         let challenge_key = challenge_key(&channel_key);
         let sockets = bind_all(binds).await?;
@@ -93,16 +93,15 @@ impl ReverseUdp {
                         peers.keys().nth(rand::random_range(..peers.len())).copied()
                     }
                 };
-                let result = match path {
+                let failed = match path {
                     Some((socket, peer)) => {
-                        match sockets[socket].send_to(&packet.bytes, peer).await {
-                            Ok(_) => Ok(()),
-                            Err(_) => Err(packet.bytes),
-                        }
+                        sockets[socket].send_to(&packet.bytes, peer).await.is_err()
                     }
-                    None => Err(packet.bytes),
+                    None => true,
                 };
-                let _ = packet.result.send(result);
+                if failed {
+                    let _ = failures.send((channel_id, packet.bytes)).await;
+                }
             }
         });
         Ok(ChannelSender::new(channel_id, tx))

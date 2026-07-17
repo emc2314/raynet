@@ -5,8 +5,8 @@ use std::sync::{Arc, RwLock};
 use raynet_core::{
     ChannelId, ConvId, CoreAction, CoreEvent, CoreEventResult, EndpointCore, RelayCore,
 };
-use raynet_shell_plugins::{ProxyMessage, ProxyPlugin, ProxySession};
-use tokio::sync::{Mutex, mpsc};
+use raynet_shell_plugins::{ChannelSendFailure, ProxyMessage, ProxyPlugin, ProxySession};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::{Duration, sleep};
 
 use crate::channels::{ChannelSenders, InboundTransportPacket};
@@ -14,6 +14,7 @@ use crate::transport::OutboundTransportPacket;
 use crate::utils::CoreClock;
 
 type Sessions = HashMap<ConvId, mpsc::Sender<ProxyMessage>>;
+const PACKET_BATCH_SIZE: usize = 64;
 
 #[derive(Clone)]
 pub(crate) struct EndpointRuntime {
@@ -22,6 +23,10 @@ pub(crate) struct EndpointRuntime {
     core: Arc<Mutex<EndpointCore>>,
     ray_tx: mpsc::Sender<OutboundTransportPacket>,
     clock: Arc<CoreClock>,
+    /// Wakes session writers waiting on `SessionWriteBlocked`.
+    writable: Arc<Notify>,
+    /// Wakes the poll loop when a core event creates an earlier deadline.
+    deadline_changed: Arc<Notify>,
 }
 
 impl EndpointRuntime {
@@ -37,16 +42,43 @@ impl EndpointRuntime {
             core,
             ray_tx,
             clock,
+            writable: Arc::new(Notify::new()),
+            deadline_changed: Arc::new(Notify::new()),
         }
     }
 
     pub async fn receive_packets(self, mut receiver: mpsc::Receiver<InboundTransportPacket>) {
-        while let Some(packet) = receiver.recv().await {
-            self.handle(CoreEvent::TransportPacketReceived {
-                channel_id: packet.channel_id,
-                bytes: packet.bytes,
-            })
-            .await;
+        let mut batch = Vec::with_capacity(PACKET_BATCH_SIZE);
+        loop {
+            batch.clear();
+            let Some(first) = receiver.recv().await else {
+                return;
+            };
+            batch.push(first);
+            while batch.len() < PACKET_BATCH_SIZE {
+                match receiver.try_recv() {
+                    Ok(packet) => batch.push(packet),
+                    Err(_) => break,
+                }
+            }
+            let mut actions = Vec::new();
+            {
+                let mut core = self.core.lock().await;
+                let elapsed = self.clock.elapsed_ms();
+                for packet in batch.drain(..) {
+                    let _ = core.handle_event(
+                        elapsed,
+                        CoreEvent::TransportPacketReceived {
+                            channel_id: packet.channel_id,
+                            bytes: packet.bytes,
+                        },
+                        &mut actions,
+                    );
+                }
+            }
+            self.writable.notify_waiters();
+            self.deadline_changed.notify_one();
+            self.execute(actions).await;
         }
     }
 
@@ -61,6 +93,7 @@ impl EndpointRuntime {
             unreachable!()
         };
         self.attach(conv_id, session);
+        self.deadline_changed.notify_one();
         self.execute(actions).await;
     }
 
@@ -76,17 +109,24 @@ impl EndpointRuntime {
         loop {
             let now = self.clock.elapsed_ms();
             let deadline = self.core.lock().await.next_deadline(now);
-            if deadline == u64::MAX {
-                sleep(Duration::from_millis(20)).await;
-            } else if deadline > now {
-                sleep(Duration::from_millis((deadline - now).min(100))).await;
-            } else {
+            if deadline <= now {
                 let mut actions = Vec::new();
                 self.core
                     .lock()
                     .await
                     .poll(self.clock.elapsed_ms(), &mut actions);
+                self.writable.notify_waiters();
                 self.execute(actions).await;
+                continue;
+            }
+            let delay_ms = if deadline == u64::MAX {
+                20
+            } else {
+                (deadline - now).min(100)
+            };
+            tokio::select! {
+                _ = sleep(Duration::from_millis(delay_ms)) => {}
+                _ = self.deadline_changed.notified() => {}
             }
         }
     }
@@ -98,6 +138,8 @@ impl EndpointRuntime {
             .lock()
             .await
             .handle_event(self.clock.elapsed_ms(), event, &mut actions);
+        self.writable.notify_waiters();
+        self.deadline_changed.notify_one();
         self.execute(actions).await;
     }
 
@@ -149,6 +191,9 @@ impl EndpointRuntime {
     async fn emit(&self, event: CoreEvent) {
         if let CoreEvent::SessionWrite { conv_id, bytes } = event {
             loop {
+                let notified = self.writable.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 let mut actions = Vec::new();
                 let result = self.core.lock().await.handle_event(
                     self.clock.elapsed_ms(),
@@ -159,10 +204,12 @@ impl EndpointRuntime {
                     &mut actions,
                 );
                 if matches!(result, CoreEventResult::SessionWriteBlocked) {
-                    sleep(Duration::from_millis(1)).await;
+                    // Wait until inbound/poll frees send window.
+                    notified.await;
                     continue;
                 }
                 assert!(matches!(result, CoreEventResult::None));
+                self.deadline_changed.notify_one();
                 self.execute(actions).await;
                 return;
             }
@@ -177,16 +224,34 @@ pub async fn forward_in(
     relay_core: Arc<Mutex<RelayCore>>,
     clock: Arc<CoreClock>,
 ) {
-    while let Some(packet) = receiver.recv().await {
+    let mut batch = Vec::with_capacity(PACKET_BATCH_SIZE);
+    loop {
+        batch.clear();
+        let Some(first) = receiver.recv().await else {
+            return;
+        };
+        batch.push(first);
+        while batch.len() < PACKET_BATCH_SIZE {
+            match receiver.try_recv() {
+                Ok(packet) => batch.push(packet),
+                Err(_) => break,
+            }
+        }
         let mut actions = Vec::new();
-        let _ = relay_core.lock().await.handle_event(
-            clock.elapsed_ms(),
-            CoreEvent::TransportPacketReceived {
-                channel_id: packet.channel_id,
-                bytes: packet.bytes,
-            },
-            &mut actions,
-        );
+        {
+            let mut core = relay_core.lock().await;
+            let elapsed = clock.elapsed_ms();
+            for packet in batch.drain(..) {
+                let _ = core.handle_event(
+                    elapsed,
+                    CoreEvent::TransportPacketReceived {
+                        channel_id: packet.channel_id,
+                        bytes: packet.bytes,
+                    },
+                    &mut actions,
+                );
+            }
+        }
         send_transport_actions(&ray_tx, actions).await;
     }
 }
@@ -215,15 +280,37 @@ async fn send_transport_action(
 
 pub async fn forward_out<F, Fut>(
     mut rx: mpsc::Receiver<OutboundTransportPacket>,
+    mut failures: mpsc::Receiver<ChannelSendFailure>,
     channels: Arc<ChannelSenders>,
     mut on_failure: F,
 ) where
     F: FnMut(OutboundTransportPacket) -> Fut,
     Fut: Future<Output = ()>,
 {
-    while let Some(packet) = rx.recv().await {
-        if let Err(packet) = channels.send(packet).await {
-            on_failure(packet).await;
+    let mut batch = Vec::with_capacity(PACKET_BATCH_SIZE);
+    loop {
+        tokio::select! {
+            biased;
+            failure = failures.recv() => {
+                let Some((channel_id, bytes)) = failure else { return };
+                on_failure(OutboundTransportPacket { channel_id, bytes }).await;
+            }
+            packet = rx.recv() => {
+                let Some(first) = packet else { return };
+                batch.clear();
+                batch.push(first);
+                while batch.len() < PACKET_BATCH_SIZE {
+                    match rx.try_recv() {
+                        Ok(packet) => batch.push(packet),
+                        Err(_) => break,
+                    }
+                }
+                for packet in batch.drain(..) {
+                    if let Err(packet) = channels.send(packet).await {
+                        on_failure(packet).await;
+                    }
+                }
+            }
         }
     }
 }

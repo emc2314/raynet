@@ -4,24 +4,28 @@ use rand::RngExt;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::channels::{ChannelSenders, InboundTransportPacket};
+use crate::channels::Channels;
+use crate::config::EndpointCoreTuning;
 use crate::remote::{EndpointRuntime, forward_out};
 use crate::transport::OutboundTransportPacket;
 use crate::utils::CoreClock;
-use raynet_core::{
-    EndpointConfig, EndpointCore, KcpConfig, RouteConfig, RouteEdge, RouteGraph, RouteNode,
-};
+use raynet_core::{EndpointConfig, EndpointCore, RouteEdge, RouteGraph, RouteNode};
 use raynet_shell_plugins::{ProxyListener, ProxyPlugin};
 
 pub fn run(
-    channels: Arc<ChannelSenders>,
-    channel_receiver: mpsc::Receiver<InboundTransportPacket>,
+    channels: Channels,
     envelope_key: Key,
     message_key: Key,
     route: Option<RouteGraph>,
+    tuning: EndpointCoreTuning,
     mut proxy_listener: ProxyListener,
     proxy: Arc<dyn ProxyPlugin>,
 ) {
+    let Channels {
+        senders: channels,
+        receiver: channel_receiver,
+        failures,
+    } = channels;
     let clock = Arc::new(CoreClock::new());
     let (ray_tx, ray_rx) = mpsc::channel::<OutboundTransportPacket>(65536);
     let local_channels = channels.channel_ids();
@@ -31,16 +35,11 @@ pub fn run(
         message_key,
         random_seed,
         boot_time_ms: clock.boot_time_ms(),
-        kcp: KcpConfig::default(),
         local_channels: local_channels.clone(),
-        route: RouteConfig {
-            graph: route_graph(&local_channels, route),
-            min_mtu: 1200,
-            feedback_interval_ms: 1_000,
-            feedback_timeout_ms: 5_000,
-        },
-        padding_reserve: 128,
-        keepalive_interval_ms: 0,
+        route: tuning.route_config(route_graph(&local_channels, route)),
+        kcp: tuning.kcp,
+        padding_reserve: tuning.padding_reserve,
+        keepalive_interval_ms: tuning.keepalive_interval_ms,
     })));
 
     let runtime = EndpointRuntime::new(proxy, endpoint_core, ray_tx, clock);
@@ -54,7 +53,7 @@ pub fn run(
     tokio::spawn(runtime.clone().poll());
 
     tokio::spawn(async move {
-        forward_out(ray_rx, channels, move |packet| {
+        forward_out(ray_rx, failures, channels, move |packet| {
             let runtime = runtime.clone();
             async move { runtime.send_failed(packet).await }
         })

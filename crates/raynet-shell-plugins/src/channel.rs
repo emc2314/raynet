@@ -1,9 +1,11 @@
 use raynet_core::ChannelId;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
+/// Outbound datagram. Delivery failures are reported asynchronously via the
+/// `failures` channel passed into channel constructors — not via a per-packet
+/// oneshot round-trip.
 pub(crate) struct SendPacket {
     pub bytes: Vec<u8>,
-    pub result: oneshot::Sender<Result<(), Vec<u8>>>,
 }
 
 #[derive(Clone)]
@@ -21,13 +23,13 @@ impl ChannelSender {
         self.channel_id
     }
 
+    /// Enqueue a packet for sending. Returns `Err` only if the channel is closed
+    /// or the queue is full after waiting (caller should treat as send failure).
     pub async fn send(&self, bytes: Vec<u8>) -> Result<(), Vec<u8>> {
-        let (result, result_rx) = oneshot::channel();
-        let packet = SendPacket { bytes, result };
-        if let Err(error) = self.tx.send(packet).await {
-            return Err(error.0.bytes);
-        }
-        result_rx.await.unwrap()
+        self.tx
+            .send(SendPacket { bytes })
+            .await
+            .map_err(|error| error.0.bytes)
     }
 }
 
@@ -49,3 +51,6 @@ impl ChannelReceiver {
         self.rx.recv().await
     }
 }
+
+/// Local send failure reported by a channel worker after enqueue succeeded.
+pub type ChannelSendFailure = (ChannelId, Vec<u8>);

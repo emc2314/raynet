@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use raynet_core::ChannelId;
-use raynet_shell_plugins::{ChannelReceiver, ChannelSender};
+use raynet_shell_plugins::{ChannelReceiver, ChannelSendFailure, ChannelSender};
 use tokio::sync::mpsc;
 
 use crate::transport::OutboundTransportPacket;
@@ -13,6 +13,12 @@ pub struct InboundTransportPacket {
 }
 
 pub struct ChannelSenders(BTreeMap<ChannelId, ChannelSender>);
+
+pub struct Channels {
+    pub senders: Arc<ChannelSenders>,
+    pub receiver: mpsc::Receiver<InboundTransportPacket>,
+    pub failures: mpsc::Receiver<ChannelSendFailure>,
+}
 
 impl ChannelSenders {
     pub fn channel_ids(&self) -> Vec<ChannelId> {
@@ -39,7 +45,8 @@ impl ChannelSenders {
 pub fn channels(
     senders: Vec<ChannelSender>,
     receivers: Vec<ChannelReceiver>,
-) -> (Arc<ChannelSenders>, mpsc::Receiver<InboundTransportPacket>) {
+    failures: mpsc::Receiver<ChannelSendFailure>,
+) -> Channels {
     let mut by_id = BTreeMap::new();
     for sender in senders {
         assert!(by_id.insert(sender.channel_id(), sender).is_none());
@@ -62,5 +69,9 @@ pub fn channels(
             }
         });
     }
-    (Arc::new(ChannelSenders(by_id)), rx)
+    Channels {
+        senders: Arc::new(ChannelSenders(by_id)),
+        receiver: rx,
+        failures,
+    }
 }

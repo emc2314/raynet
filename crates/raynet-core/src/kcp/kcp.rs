@@ -456,10 +456,11 @@ impl Kcp {
     }
 
     /// Call this when you received a packet from raw connection
-    pub fn input(&mut self, mut buf: &[u8]) -> KcpResult<usize> {
+    pub fn input(&mut self, current: u32, mut buf: &[u8]) -> KcpResult<usize> {
         if buf.len() < KCP_OVERHEAD {
             return Err(Error::InvalidSegmentSize);
         }
+        self.current = current;
 
         let input_size = buf.len();
         let mut flag = false;
@@ -553,7 +554,7 @@ impl Kcp {
             buf.advance(len);
         }
 
-        if flag {
+        if flag && self.fastresend.is_some() {
             self.parse_fastack(max_ack, latest_ts);
         }
 
@@ -886,9 +887,37 @@ mod tests {
             },
         );
         receiver.update(123).unwrap();
-        receiver.input(&packet).unwrap();
+        receiver.input(123, &packet).unwrap();
         let mut output = [0; 3];
         assert_eq!(receiver.recv(&mut output).unwrap(), 3);
         assert_eq!(&output, b"KCP");
+    }
+
+    #[test]
+    fn input_uses_event_time_for_rtt_sample() {
+        let params = KcpParams {
+            mtu: 1400,
+            send_window: 64,
+            receive_window: 64,
+            nodelay: true,
+            fast_resend: None,
+            congestion_control: true,
+            time_scale: 1,
+        };
+        let mut sender = Kcp::new(7, params);
+        let mut receiver = Kcp::new(7, params);
+
+        sender.update(100).unwrap();
+        sender.send(b"sample").unwrap();
+        sender.flush().unwrap();
+        let data = sender.take_output().remove(0);
+
+        receiver.update(200).unwrap();
+        receiver.input(200, &data).unwrap();
+        receiver.flush().unwrap();
+        let ack = receiver.take_output().remove(0);
+
+        sender.input(350, &ack).unwrap();
+        assert_eq!(sender.rx_srtt, 250);
     }
 }

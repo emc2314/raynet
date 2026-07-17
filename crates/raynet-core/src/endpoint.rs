@@ -120,7 +120,7 @@ impl EndpointCore {
             receive_window: config.kcp.receive_window,
             nodelay: true,
             fast_resend,
-            congestion_control: true,
+            congestion_control: false,
             time_scale: config.kcp.time_scale,
         };
         let close_deadline_ms = 3 * 6_000u64 * u64::from(config.kcp.time_scale);
@@ -745,7 +745,7 @@ impl EndpointSession {
     }
 
     fn input_packet(&mut self, elapsed_ms: u64, packet: &[u8]) -> SessionOutput {
-        self.kcp.input(packet).ok().unwrap();
+        self.kcp.input(elapsed_ms as u32, packet).ok().unwrap();
         let packets = self.flush_now(elapsed_ms);
         SessionOutput {
             messages: self.recv_messages(),
